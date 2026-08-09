@@ -146,7 +146,11 @@ runs:
         echo "::group::Install Deps"
         if [ "${{ steps.claudecode-check.outputs.enable_claudecode }}" == "true" ]; then
           pip install -r "$ACTION_PATH/claudecode/requirements.txt"
-          npm install -g @anthropic-ai/claude-code
+          # Pinned for reproducibility + supply-chain safety (matches this action's SHA-pin
+          # discipline for every actions/* step). Floor is 2.1.163 - the CVE-2026-54316 fix
+          # (HF-download-counter API-key exfil), relevant because this step runs claude over an
+          # attacker-authored PR diff with ANTHROPIC_API_KEY in env. Bump deliberately.
+          npm install -g @anthropic-ai/claude-code@2.1.226
         fi
         echo "::endgroup::"
     
