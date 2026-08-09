@@ -57,6 +57,14 @@ outputs:
     description: 'Path to the results JSON file'
     value: ${{ steps.claudecode-scan.outputs.results_file }}
 
+  review-status:
+    description: 'Completed only when a fail-closed result validation succeeds'
+    value: ${{ steps.claudecode-scan.outputs.review_status }}
+
+  reviewed-head-sha:
+    description: 'Exact pull-request head SHA covered by the completed review'
+    value: ${{ steps.claudecode-scan.outputs.reviewed_head_sha }}
+
 runs:
   using: 'composite'
   steps:
@@ -76,12 +84,10 @@ runs:
     - name: Check ClaudeCode run history
       id: claudecode-history
       if: github.event_name == 'pull_request'
-      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0 pinned to commit hash
+      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0 pinned to commit hash
       with:
         path: .claudecode-marker
-        key: claudecode-${{ github.repository_id }}-pr-${{ github.event.pull_request.number }}-${{ github.sha }}
-        restore-keys: |
-          claudecode-${{ github.repository_id }}-pr-${{ github.event.pull_request.number }}-
+        key: claudecode-${{ github.repository_id }}-pr-${{ github.event.pull_request.number }}-${{ github.event.pull_request.head.sha }}
     
     - name: Determine ClaudeCode enablement
       id: claudecode-check
@@ -89,6 +95,8 @@ runs:
       env:
         PR_NUMBER: ${{ github.event.pull_request.number }}
         RUN_EVERY_COMMIT: ${{ inputs.run-every-commit }}
+        REVIEW_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        ACTION_PATH: ${{ github.action_path }}
       run: |
         # Check if ClaudeCode should be enabled
         ENABLE_CLAUDECODE="true"
@@ -99,13 +107,17 @@ runs:
           PR_NUMBER="$PR_NUMBER"
           CACHE_HIT="${{ steps.claudecode-history.outputs.cache-hit }}"
 
-          # Now check cache - if ClaudeCode has already run, disable unless run-every-commit is true
-          # Check if marker file exists (cache may have been restored from a different SHA)
-          if [ "$RUN_EVERY_COMMIT" != "true" ] && [ -f ".claudecode-marker/marker.json" ]; then
-            echo "ClaudeCode has already run on PR #$PR_NUMBER (found marker file), forcing disable to avoid false positives"
+          # Only an exact-head completed review may satisfy the cache. Prefix
+          # restore is deliberately forbidden so a rebase cannot inherit state.
+          MARKER_VALID="false"
+          if [ "$CACHE_HIT" == "true" ] && [ -f ".claudecode-marker/marker.json" ]; then
+            MARKER_VALID=$(PYTHONPATH="$ACTION_PATH" python -m claudecode.review_state .claudecode-marker/marker.json "$REVIEW_HEAD_SHA")
+          fi
+          if [ "$RUN_EVERY_COMMIT" != "true" ] && [ "$MARKER_VALID" == "true" ]; then
+            echo "ClaudeCode has completed a review for exact PR head $REVIEW_HEAD_SHA; reusing it"
             ENABLE_CLAUDECODE="false"
-          elif [ "$RUN_EVERY_COMMIT" == "true" ] && [ -f ".claudecode-marker/marker.json" ]; then
-            echo "ClaudeCode has already run on PR #$PR_NUMBER but run-every-commit is enabled, running again"
+          elif [ "$RUN_EVERY_COMMIT" == "true" ] && [ "$MARKER_VALID" == "true" ]; then
+            echo "ClaudeCode has completed this exact head but run-every-commit is enabled; running again"
           elif [ "$ENABLE_CLAUDECODE" == "true" ]; then
             echo "ClaudeCode will run for PR #$PR_NUMBER (first run)"
           fi
@@ -119,40 +131,6 @@ runs:
         else
           echo "ClaudeCode is disabled for this run"
         fi
-    
-    - name: Reserve ClaudeCode slot to prevent race conditions
-      if: steps.claudecode-check.outputs.enable_claudecode == 'true' && github.event_name == 'pull_request'
-      shell: bash
-      env:
-        REPOSITORY_ID: ${{ github.repository_id }}
-        REPOSITORY: ${{ github.repository }}
-        PR_NUMBER: ${{ github.event.pull_request.number }}
-        SHA: ${{ github.sha }}
-        RUN_ID: ${{ github.run_id }}
-        RUN_NUMBER: ${{ github.run_number }}
-      run: |
-        # Create a reservation marker immediately to prevent other concurrent runs
-        mkdir -p .claudecode-marker
-        cat > .claudecode-marker/marker.json << EOF
-        {
-          "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
-          "repository_id": "$REPOSITORY_ID",
-          "repository": "$REPOSITORY",
-          "pr_number": $PR_NUMBER,
-          "sha": "$SHA",
-          "status": "reserved",
-          "run_id": "$RUN_ID",
-          "run_number": "$RUN_NUMBER"
-        }
-        EOF
-        echo "Created ClaudeCode reservation marker for PR #$PR_NUMBER"
-    
-    - name: Save ClaudeCode reservation to cache
-      if: steps.claudecode-check.outputs.enable_claudecode == 'true' && github.event_name == 'pull_request'
-      uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0 pinned to commit hash
-      with:
-        path: .claudecode-marker
-        key: claudecode-${{ github.repository_id }}-pr-${{ github.event.pull_request.number }}-${{ github.sha }}
     
     - name: Set up Node.js
       if: steps.claudecode-check.outputs.enable_claudecode == 'true'
@@ -170,7 +148,6 @@ runs:
           pip install -r "$ACTION_PATH/claudecode/requirements.txt"
           npm install -g @anthropic-ai/claude-code
         fi
-        sudo apt-get update && sudo apt-get install -y jq
         echo "::endgroup::"
     
     - name: Run ClaudeCode scan
@@ -189,13 +166,10 @@ runs:
         CLAUDE_MODEL: ${{ inputs.claude-model }}
         CLAUDECODE_TIMEOUT: ${{ inputs.claudecode-timeout }}
         ACTION_PATH: ${{ github.action_path }}
+        REVIEW_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
       run: |
         echo "Running ClaudeCode AI security analysis..."
         echo "----------------------------------------"
-        
-        # Initialize outputs
-        echo "findings_count=0" >> $GITHUB_OUTPUT
-        echo "results_file=claudecode/claudecode-results.json" >> $GITHUB_OUTPUT
         
         # Skip ClaudeCode if not a PR
         if [ "${{ github.event_name }}" != "pull_request" ]; then
@@ -241,68 +215,45 @@ runs:
         # Run from the action root directory so Python can find the claudecode module
         python -u claudecode/github_action_audit.py > claudecode/claudecode-results.json 2>claudecode/claudecode-error.log || CLAUDECODE_EXIT_CODE=$?
         
-        if [ -n "$CLAUDECODE_EXIT_CODE" ]; then
-          echo "::warning::ClaudeCode exited with code $CLAUDECODE_EXIT_CODE"
-        else
-          echo "ClaudeCode scan completed successfully"
-        fi
-        
-        # Parse ClaudeCode results and count findings regardless of exit code
-        if [ -f claudecode/claudecode-results.json ]; then
-          FILE_SIZE=$(wc -c < claudecode/claudecode-results.json)
-          echo "ClaudeCode results file size: $FILE_SIZE bytes"
-          
-          # Check if file is empty or too small
-          if [ "$FILE_SIZE" -lt 2 ]; then
-            echo "::warning::ClaudeCode results file is empty or invalid (size: $FILE_SIZE bytes)"
-            echo "::warning::ClaudeCode may have failed silently. Check claudecode-error.log"
-            if [ -f claudecode/claudecode-error.log ]; then
-              echo "Error log contents:"
-              cat claudecode/claudecode-error.log
-            fi
-            echo "findings_count=0" >> $GITHUB_OUTPUT
-          else
-            echo "ClaudeCode results preview:"
-            head -n 300 claudecode/claudecode-results.json || echo "Unable to preview results"
-                        
-            # Check if the result is an error
-            if jq -e '.error' claudecode/claudecode-results.json > /dev/null 2>&1; then
-              ERROR_MSG=$(jq -r '.error' claudecode/claudecode-results.json)
-              echo "::warning::ClaudeCode error: $ERROR_MSG"
-              echo "findings_count=0" >> $GITHUB_OUTPUT
-            else
-              # Use -r to get raw output and handle potential null/missing findings array
-              CLAUDECODE_FINDINGS_COUNT=$(jq -r '.findings | if . == null then 0 else length end' claudecode/claudecode-results.json 2>/dev/null || echo "0")
-              echo "::debug::Extracted ClaudeCode findings count: $CLAUDECODE_FINDINGS_COUNT"
-              echo "findings_count=$CLAUDECODE_FINDINGS_COUNT" >> $GITHUB_OUTPUT
-              echo "ClaudeCode found $CLAUDECODE_FINDINGS_COUNT security issues"
-              
-              # Also create findings.json for PR comment script
-              jq '.findings // []' claudecode/claudecode-results.json > findings.json || echo '[]' > findings.json
-            fi
-          fi
-        else
-          echo "::warning::ClaudeCode results file not found"
-          if [ -f claudecode/claudecode-error.log ]; then
-            echo "Error log contents:"
-            cat claudecode/claudecode-error.log
-          fi
-          echo "findings_count=0" >> $GITHUB_OUTPUT
-        fi
-        
-        # Always copy files to workspace root regardless of the outcome
-        # This ensures artifact upload and PR commenting can find them
-        if [ -f findings.json ]; then
-          cp findings.json ${{ github.workspace }}/findings.json || true
-        fi
+        CLAUDECODE_EXIT_CODE=${CLAUDECODE_EXIT_CODE:-0}
+
+        # Preserve diagnostics before validation so failed reviews can be inspected.
         if [ -f claudecode/claudecode-results.json ]; then
           cp claudecode/claudecode-results.json ${{ github.workspace }}/claudecode-results.json || true
         fi
         if [ -f claudecode/claudecode-error.log ]; then
           cp claudecode/claudecode-error.log ${{ github.workspace }}/claudecode-error.log || true
         fi
+
+        python -m claudecode.validate_action_result \
+          --results claudecode/claudecode-results.json \
+          --process-exit-code "$CLAUDECODE_EXIT_CODE" \
+          --findings-output "${{ github.workspace }}/findings.json" \
+          --github-output "$GITHUB_OUTPUT" \
+          --reviewed-head-sha "$REVIEW_HEAD_SHA"
         
         echo "::endgroup::"
+
+    - name: Mark exact head review completed
+      if: steps.claudecode-scan.outputs.review_status == 'completed' && github.event_name == 'pull_request'
+      shell: bash
+      env:
+        REPOSITORY_ID: ${{ github.repository_id }}
+        REPOSITORY: ${{ github.repository }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+        REVIEW_HEAD_SHA: ${{ steps.claudecode-scan.outputs.reviewed_head_sha }}
+        RUN_ID: ${{ github.run_id }}
+        RUN_NUMBER: ${{ github.run_number }}
+      run: |
+        mkdir -p .claudecode-marker
+        python -c 'import json,os,pathlib; pathlib.Path(".claudecode-marker/marker.json").write_text(json.dumps({"repository_id": os.environ["REPOSITORY_ID"], "repository": os.environ["REPOSITORY"], "pr_number": int(os.environ["PR_NUMBER"]), "sha": os.environ["REVIEW_HEAD_SHA"], "status": "completed", "run_id": os.environ["RUN_ID"], "run_number": os.environ["RUN_NUMBER"]}, sort_keys=True) + "\n", encoding="utf-8")'
+
+    - name: Cache exact head completed review
+      if: steps.claudecode-scan.outputs.review_status == 'completed' && github.event_name == 'pull_request'
+      uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0 pinned to commit hash
+      with:
+        path: .claudecode-marker
+        key: claudecode-${{ github.repository_id }}-pr-${{ github.event.pull_request.number }}-${{ github.event.pull_request.head.sha }}
     
     
     - name: Upload scan results
