@@ -56,7 +56,7 @@ This action is not hardened against prompt injection attacks and should only be 
 | `exclude-directories` | Comma-separated list of directories to exclude from scanning | None | No |
 | `claude-model` | Claude [model name](https://docs.anthropic.com/en/docs/about-claude/models/overview#model-names) to use. Defaults to Opus 4.1. | `claude-opus-4-1-20250805` | No |
 | `claudecode-timeout` | Timeout for ClaudeCode analysis in minutes | `20` | No |
-| `run-every-commit` | Run ClaudeCode on every commit (skips cache check). Warning: May increase false positives on PRs with many commits. | `false` | No |
+| `run-every-commit` | Review every workflow invocation even when the exact PR head already has a completed review. Cache entries never carry across head commits. | `false` | No |
 | `false-positive-filtering-instructions` | Path to custom false positive filtering instructions text file | None | No |
 | `custom-security-scan-instructions` | Path to custom security scan instructions text file to append to audit prompt | None | No |
 
@@ -66,6 +66,8 @@ This action is not hardened against prompt injection attacks and should only be 
 |--------|-------------|
 | `findings-count` | Total number of security findings |
 | `results-file` | Path to the results JSON file |
+| `review-status` | `completed` only after the result passes fail-closed validation |
+| `reviewed-head-sha` | Exact pull-request head SHA covered by the completed review |
 
 ## How It Works
 

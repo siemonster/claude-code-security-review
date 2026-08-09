@@ -171,6 +171,32 @@ class TestSimpleClaudeRunner:
         ]
         assert call_args[1]['input'] == 'test prompt'
         assert call_args[1]['cwd'] == Path('/tmp/test')
+
+    @patch('subprocess.run')
+    def test_run_security_audit_rejects_api_error_envelope(self, mock_run):
+        """A parseable authentication error is not a completed empty review."""
+        mock_run.return_value = Mock(
+            returncode=0,
+            stdout=json.dumps({
+                "type": "result",
+                "subtype": "success",
+                "is_error": True,
+                "api_error_status": 401,
+                "result": "authentication failed",
+            }),
+            stderr='',
+        )
+
+        runner = SimpleClaudeRunner()
+        with patch('pathlib.Path.exists', return_value=True):
+            success, error, results = runner.run_security_audit(
+                Path('/tmp/test'),
+                "test prompt",
+            )
+
+        assert success is False
+        assert error == "Claude Code reported an error envelope (status 401)"
+        assert results == {}
     
     @patch('subprocess.run')
     def test_run_security_audit_large_prompt_warning(self, mock_run, capsys):

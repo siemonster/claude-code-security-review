@@ -269,6 +269,15 @@ class SimpleClaudeRunner:
                         parsed_result.get('subtype') == 'error_during_execution' and
                         attempt == 0):
                         continue  # Retry
+
+                    # A Claude Code command may return a syntactically valid JSON envelope
+                    # while reporting an authentication or execution failure inside it.
+                    # Such envelopes are not completed reviews and must never become an
+                    # empty, successful findings result.
+                    if isinstance(parsed_result, dict) and parsed_result.get('is_error'):
+                        error_status = parsed_result.get('api_error_status')
+                        status_suffix = f" (status {error_status})" if error_status is not None else ""
+                        return False, f"Claude Code reported an error envelope{status_suffix}", {}
                     
                     # Extract security findings
                     parsed_results = self._extract_security_findings(parsed_result)
