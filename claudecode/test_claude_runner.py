@@ -47,25 +47,46 @@ class TestSimpleClaudeRunner:
         )
     
     @patch('subprocess.run')
-    def test_validate_claude_available_no_api_key(self, mock_run):
-        """Test Claude validation without API key."""
+    def test_validate_claude_available_oauth_token_only(self, mock_run):
+        """A Claude Code OAuth token authenticates the CLI without an API key."""
         mock_run.return_value = Mock(
             returncode=0,
             stdout='claude version 1.0.0',
             stderr=''
         )
-        
-        # Remove API key
+
         env = os.environ.copy()
         env.pop('ANTHROPIC_API_KEY', None)
-        
+        env['CLAUDE_CODE_OAUTH_TOKEN'] = 'test-oauth-token'
+
         with patch.dict(os.environ, env, clear=True):
             runner = SimpleClaudeRunner()
             success, error = runner.validate_claude_available()
-        
+
+        assert success is True
+        assert error == ''
+
+    @patch('subprocess.run')
+    def test_validate_claude_available_no_credential(self, mock_run):
+        """Test Claude validation with neither credential set."""
+        mock_run.return_value = Mock(
+            returncode=0,
+            stdout='claude version 1.0.0',
+            stderr=''
+        )
+
+        # Remove both credentials
+        env = os.environ.copy()
+        env.pop('ANTHROPIC_API_KEY', None)
+        env.pop('CLAUDE_CODE_OAUTH_TOKEN', None)
+
+        with patch.dict(os.environ, env, clear=True):
+            runner = SimpleClaudeRunner()
+            success, error = runner.validate_claude_available()
+
         assert success is False
-        assert 'ANTHROPIC_API_KEY environment variable is not set' in error
-    
+        assert 'Neither ANTHROPIC_API_KEY nor CLAUDE_CODE_OAUTH_TOKEN is set' in error
+
     @patch('subprocess.run')
     def test_validate_claude_available_not_installed(self, mock_run):
         """Test Claude validation when not installed."""
