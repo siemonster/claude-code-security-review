@@ -17,7 +17,7 @@ budgets; Python/JSON allocation multipliers, caller preallocation and every CPU
 or memory effect are not solved. Existing packing/rebuild costs remain bounded
 only within this intentionally small synthetic domain.
 
-Schema 2 (incompatible with schema1 plans/ledgers) supports A/M/D/R, regular UTF-8 blobs, and 100644/100755 modes. Modified
+Schema 3 (incompatible with schema1/2 inventory/plans/ledgers) supports A/M/D/R, regular UTF-8 blobs, and 100644/100755 modes. Modified
 and renamed entries cover FULL base and head, deletions cover base, additions
 cover head (including zero-byte blobs). Symlinks/submodules/non-UTF8 refuse.
 Every byte is REVIEWED_RAW; no equivalence, exclusions or content markers apply.
@@ -153,7 +153,7 @@ def _resource_bounds(inventory, blobs, budget):
 
 def _validate(inventory, blobs, budget):
     _keys(inventory, "schema identity compare_file_count files dependencies")
-    _need(type(inventory["schema"]) is int and inventory["schema"] == 2, "schema refused")
+    _need(type(inventory["schema"]) is int and inventory["schema"] == 3, "schema refused")
     _identity(inventory["identity"])
     _budget(budget)
     _need(type(blobs) is dict, "blob map refused")
@@ -225,24 +225,18 @@ def _file_flags(f):
 
 
 def _flagged_paths(inventory):
-    return [dict(path=f["path"], flags=_file_flags(f)) for f in sorted(inventory["files"], key=lambda f: f["path"]) if _file_flags(f)]
+    return [dict(path=f["path"], old_path=f["old_path"], flags=_file_flags(f)) for f in sorted(inventory["files"], key=lambda f: f["path"]) if _file_flags(f)]
 
 
 def _request(inventory, blobs, chunk_id, items):
-    envelope = dict(schema=2, scope="MODEL_ONLY", qualification="NOT_ADMITTED", gate_wired=False,
+    envelope = dict(schema=3, scope="MODEL_ONLY", qualification="NOT_ADMITTED", gate_wired=False,
                     identity=inventory["identity"], chunk_id=chunk_id, item_count=len(items))
-    parts = [b"C003-INERT-BYTE-PLAN-2\n", _frame(_json(envelope))]
+    parts = [b"C003-INERT-BYTE-PLAN-3\n", _frame(_json(envelope))]
     files = {f["path"]: f for f in inventory["files"]}
     for item in items:
         f = files[item["path"]]
         desc = f[item["side"]]
-        flags = []
-        if f["path"].startswith(".github/") or (f["old_path"] or "").startswith(".github/"):
-            flags.append("WORKFLOW")
-        if f["status"] in ("D", "R"):
-            flags.append({"D": "DELETION", "R": "RENAME"}[f["status"]])
-        if f["base"] is not None and f["head"] is not None and f["base"]["mode"] != f["head"]["mode"]:
-            flags.append("MODE_CHANGE")
+        flags = _file_flags(f)
         header = dict(item, old_path=f["old_path"], status=f["status"], mode=desc["mode"],
                       size=desc["bytes"], sha256=desc["sha256"], disposition="REVIEWED_RAW", flags=flags)
         parts.extend([_frame(_json(header)), _frame(blobs[item["oid"]][item["start"]:item["end"]])])
@@ -315,7 +309,7 @@ def _build(inventory, blobs, budget):
                 _need(next_start > start, "overlap prevents progress")
                 start = next_start
     flush()
-    planned = dict(schema=2, scope="MODEL_ONLY", qualification="NOT_ADMITTED", gate_wired=False,
+    planned = dict(schema=3, scope="MODEL_ONLY", qualification="NOT_ADMITTED", gate_wired=False,
                    inventory=inventory, blobs={oid: raw.hex() for oid, raw in blobs.items()},
                    budget=dict(budget), chunks=chunks, flagged_paths=_flagged_paths(inventory))
     planned["plan_sha256"] = _sha(_json(planned))
@@ -345,13 +339,14 @@ def _guarded(function, *args):
 
 def _check_plan(planned):
     _keys(planned, "schema scope qualification gate_wired inventory blobs budget chunks flagged_paths plan_sha256")
-    _need(type(planned["schema"]) is int and planned["schema"] == 2, "schema refused")
+    _need(type(planned["schema"]) is int and planned["schema"] == 3, "schema refused")
     _need(planned["scope"] == "MODEL_ONLY" and planned["qualification"] == "NOT_ADMITTED" and
           planned["gate_wired"] is False, "qualification refused")
     _hex(planned["plan_sha256"], 64)
     _need(type(planned["flagged_paths"]) is list and len(planned["flagged_paths"]) <= 128, "resource flags refused")
     for row in planned["flagged_paths"]:
-        _keys(row, "path flags"); _path(row["path"])
+        _keys(row, "path old_path flags"); _path(row["path"])
+        if row["old_path"] is not None: _path(row["old_path"])
         _need(type(row["flags"]) is list and len(row["flags"]) <= 4 and
               all(flag in ("WORKFLOW", "DELETION", "RENAME", "MODE_CHANGE") for flag in row["flags"]), "flags refused")
     _budget(planned["budget"])
@@ -397,22 +392,101 @@ def serialize(planned, chunk_id):
 
 
 
-def _coverage_proof(p, blobs):
+def _coverage_proof(p, blobs, inventory):
     """Independent interval/request proof: deliberately never calls _build/_request.
 
     Equality with a second planner invocation is NOT this proof. Required sides,
     raw-range bytes, framing, caps and intervals are derived independently here.
-    The JSON primitive and digest primitive are shared, not planner control flow.
+    The JSON/digest/type helpers are shared, not builder validation/control flow.
+    Explicit inventory descriptors are independently bound to decoded raw bytes.
     """
-    inv = p["inventory"]
-    required, ranges, locations = {}, {}, {}
-    files = {f["path"]: f for f in inv["files"]}
+    inv = inventory  # Explicit verify input, never the builder's inventory echo.
+    _keys(inv, "schema identity compare_file_count files dependencies")
+    _need(type(inv["schema"]) is int and inv["schema"] == 3, "schema refused")
+    _identity(inv["identity"])
+    _need(_json(p["inventory"]["identity"]) == _json(inv["identity"]), "independent identity refused")
+    _budget(p["budget"])
+    _need(type(inv["files"]) is list and 0 < len(inv["files"]) <= p["budget"]["max_files"],
+          "independent input files refused")
+    _integer(inv["compare_file_count"], 1)
+    _need(inv["compare_file_count"] == len(inv["files"]), "independent input count refused")
+    _need(type(blobs) is dict and len(blobs) <= 2 * p["budget"]["max_files"], "independent input blobs refused")
+    raw_total = 0
+    for raw in blobs.values():
+        _need(type(raw) is bytes, "independent input blob type refused")
+        raw_total += len(raw)
+        _need(raw_total <= p["budget"]["max_total_bytes"], "independent input bytes refused")
+    required, ranges, locations, files, used, old_paths = {}, {}, {}, {}, set(), set()
+    logical = 0
+    derived_flags, file_flags = [], {}
     for f in inv["files"]:
+        _keys(f, "path old_path status base head")
+        _path(f["path"])
+        _need(f["path"] not in files, "independent input path refused")
+        files[f["path"]] = f
+        _need(f["status"] in ("A", "M", "D", "R"), "independent input status refused")
+        if f["status"] == "R":
+            _path(f["old_path"])
+            _need(f["old_path"] != f["path"] and f["old_path"] not in old_paths, "independent input rename refused")
+            old_paths.add(f["old_path"])
+        else:
+            _need(f["old_path"] is None, "independent input rename refused")
         sides = {"A": ("head",), "D": ("base",), "M": ("base", "head"), "R": ("base", "head")}[f["status"]]
-        for side in sides:
+        for side in ("base", "head"):
+            desc = f[side]
+            if side not in sides:
+                _need(desc is None, "independent input sides refused")
+                continue
+            _need(type(desc) is dict and set(desc) == {"oid", "bytes", "sha256", "mode"},
+                  "independent input descriptor refused")
+            _hex(desc["oid"], 40); _hex(desc["sha256"], 64); _integer(desc["bytes"])
+            _need(desc["mode"] in ("100644", "100755"), "independent input descriptor refused")
+            logical += desc["bytes"]
+            _need(logical <= p["budget"]["max_total_bytes"], "independent input bytes refused")
+            _need(desc["oid"] in blobs, "independent input blob missing")
+            raw = blobs[desc["oid"]]
+            _need(len(raw) == desc["bytes"] and _sha(raw) == desc["sha256"], "independent input blob pin refused")
+            oid = hashlib.sha1(b"blob " + str(len(raw)).encode("ascii") + b"\0" + raw).hexdigest()
+            _need(oid == desc["oid"], "independent input blob oid refused")
+            utf8 = True
+            try:
+                raw.decode("utf-8", errors="strict")
+            except UnicodeDecodeError:
+                utf8 = False
+            _need(utf8 and b"\0" not in raw, "independent input encoding refused")
+            used.add(desc["oid"])
             key = (f["path"], side)
-            required[key] = f[side]
+            required[key] = desc
             ranges[key], locations[key] = [], set()
+        flags = []
+        if f["path"].startswith(".github/") or (f["old_path"] or "").startswith(".github/"):
+            flags.append("WORKFLOW")
+        if f["status"] in ("D", "R"):
+            flags.append({"D": "DELETION", "R": "RENAME"}[f["status"]])
+        if f["base"] is not None and f["head"] is not None and f["base"]["mode"] != f["head"]["mode"]:
+            flags.append("MODE_CHANGE")
+        file_flags[f["path"]] = flags
+        if flags:
+            derived_flags.append(dict(path=f["path"], old_path=f["old_path"], flags=flags))
+    derived_flags.sort(key=lambda row: row["path"])
+    _need(_json(p["flagged_paths"]) == _json(derived_flags), "independent flags refused")
+    _need(not (old_paths & set(files)), "independent input rename refused")
+    _need(set(blobs) == used, "independent input blob set refused")
+    deps = inv["dependencies"]
+    _keys(deps, "status groups")
+    _need(deps["status"] == "SUPPLIED_COMPLETE" and type(deps["groups"]) is list and
+          len(deps["groups"]) <= p["budget"]["max_files"], "independent input groups refused")
+    grouped = []
+    for group in deps["groups"]:
+        _keys(group, "kind paths")
+        _need(group["kind"] in ("ATOMIC", "STREAM") and type(group["paths"]) is list and
+              0 < len(group["paths"]) <= p["budget"]["max_files"] - len(grouped), "independent input groups refused")
+        _need(group["kind"] != "STREAM" or len(group["paths"]) == 1, "independent input groups refused")
+        for path in group["paths"]:
+            _path(path)
+        grouped.extend(group["paths"])
+    _need(len(grouped) == len(files) and len(set(grouped)) == len(grouped) and set(grouped) == set(files),
+          "independent input groups refused")
     _need(type(p["chunks"]) is list and 0 < len(p["chunks"]) <= p["budget"]["max_chunks"],
           "independent chunks refused")
     seen = set()
@@ -423,9 +497,9 @@ def _coverage_proof(p, blobs):
         _integer(chunk["id"])
         _need(chunk["id"] == ordinal, "independent chunk order refused")
         _need(type(chunk["items"]) is list and chunk["items"], "independent items refused")
-        envelope = dict(schema=2, scope="MODEL_ONLY", qualification="NOT_ADMITTED", gate_wired=False,
+        envelope = dict(schema=3, scope="MODEL_ONLY", qualification="NOT_ADMITTED", gate_wired=False,
                         identity=inv["identity"], chunk_id=ordinal, item_count=len(chunk["items"]))
-        parts = [b"C003-INERT-BYTE-PLAN-2\n", frame(_json(envelope))]
+        parts = [b"C003-INERT-BYTE-PLAN-3\n", frame(_json(envelope))]
         for item in chunk["items"]:
             _keys(item, "path side oid start end")
             _path(item["path"])
@@ -448,13 +522,7 @@ def _coverage_proof(p, blobs):
                 utf8 = False
             _need(utf8, "independent utf8 range refused")
             f = files[item["path"]]
-            flags = []
-            if f["path"].startswith(".github/") or (f["old_path"] or "").startswith(".github/"):
-                flags.append("WORKFLOW")
-            if f["status"] in ("D", "R"):
-                flags.append({"D": "DELETION", "R": "RENAME"}[f["status"]])
-            if f["base"] is not None and f["head"] is not None and f["base"]["mode"] != f["head"]["mode"]:
-                flags.append("MODE_CHANGE")
+            flags = file_flags[item["path"]]
             header = dict(item, old_path=f["old_path"], status=f["status"], mode=desc["mode"],
                           size=size, sha256=desc["sha256"], disposition="REVIEWED_RAW", flags=flags)
             parts.extend((frame(_json(header)), frame(value)))
@@ -482,6 +550,7 @@ def _coverage_proof(p, blobs):
         if group["kind"] == "ATOMIC":
             chunks = {n for key in required if key[0] in group["paths"] for n in locations[key]}
             _need(len(chunks) == 1, "independent atomic closure refused")
+    return derived_flags
 
 
 def verify(ledger, inventory):
@@ -489,20 +558,21 @@ def verify(ledger, inventory):
 
     A match binds supplied bytes/identities/ranges, not their authority or model
     comprehension. Malformed or failed stub results cannot become zero findings.
+    Budget is the ledger plan's own assertion within synthetic ceilings, not an
+    independently supplied verifying-caller budget or approved service limit.
     """
     reason = None
     findings = []
     flagged_paths = None
     try:
         _keys(ledger, "schema plan results current_head")
-        _need(type(ledger["schema"]) is int and ledger["schema"] == 2, "schema refused")
+        _need(type(ledger["schema"]) is int and ledger["schema"] == 3, "schema refused")
         p = ledger["plan"]
         p, blobs = _check_plan(p)
         expected = _build(inventory, blobs, p["budget"])
         _need(_json(expected) == _json(p), "inventory binding refused")
         p = expected
-        _coverage_proof(p, blobs)
-        flagged_paths = p["flagged_paths"]
+        flagged_paths = _coverage_proof(p, blobs, inventory)
         _need(ledger["current_head"] == inventory["identity"]["head"], "head moved")
         _need(type(ledger["results"]) is list and len(ledger["results"]) == len(p["chunks"]),
               "result count refused")
@@ -543,7 +613,7 @@ def verify(ledger, inventory):
         reason = str(error)
     except (TypeError, ValueError, KeyError, OverflowError, RecursionError):
         reason = "malformed ledger"
-    return dict(schema=2, ok=reason is None, reasons=[] if reason is None else [reason],
+    return dict(schema=3, ok=reason is None, reasons=[] if reason is None else [reason],
                 scope="MODEL_ONLY", qualification="NOT_ADMITTED", gate_wired=False,
                 security_review_completed=False, provider_verified=False,
                 coverage="SYNTHETIC_BYTES_ONLY", stub_findings=findings if reason is None else None,
