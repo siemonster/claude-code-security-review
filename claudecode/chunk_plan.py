@@ -4,9 +4,20 @@ Only plan(inventory, blobs, budget), serialize(plan, chunk_id), and
 verify(ledger, inventory) are public. All inputs are explicit in-memory values.
 No Git/compare discovery, filesystem, environment, provider, tokenizer or model
 access is performed. Caller-supplied dependency closure is an assertion, not
-inferred or authenticated. Byte budgets do not establish token or cost budgets.
+inferred or authenticated. Byte budgets bound framed DATA ONLY, excluding any later instructions, and do
+not establish token or cost budgets. compare_file_count is self-asserted; the
+challenge is run-level only, not a per-chunk instruction-retention proof.
 
-Schema 1 supports A/M/D/R, regular UTF-8 blobs, and 100644/100755 modes. Modified
+Synthetic hard ceilings:128 files,2MiB total raw AND logical base/head referenced
+bytes,1MiB framed-data bytes/request,128 chunks. Required max_files/max_total_bytes
+caller limits may be smaller. Shared blobs count once for raw storage and once
+PER reference for logical work. Encoded plan hex is capped before decoding;
+group/item counts are bounded. These are local refusal limits, not real service
+budgets; Python/JSON allocation multipliers, caller preallocation and every CPU
+or memory effect are not solved. Existing packing/rebuild costs remain bounded
+only within this intentionally small synthetic domain.
+
+Schema 2 (incompatible with schema1 plans/ledgers) supports A/M/D/R, regular UTF-8 blobs, and 100644/100755 modes. Modified
 and renamed entries cover FULL base and head, deletions cover base, additions
 cover head (including zero-byte blobs). Symlinks/submodules/non-UTF8 refuse.
 Every byte is REVIEWED_RAW; no equivalence, exclusions or content markers apply.
@@ -108,19 +119,48 @@ def _descriptor(descriptor, blobs):
     _need(valid and b"\0" not in raw, "unsupported encoding")
 
 
+
+def _budget(budget):
+    _keys(budget, "max_request_bytes max_chunks overlap_bytes max_files max_total_bytes")
+    for name in budget:
+        _integer(budget[name], 1)
+    _need(budget["overlap_bytes"] < budget["max_request_bytes"], "budget refused")
+    _need(budget["max_files"] <= 128 and budget["max_total_bytes"] <= 2097152 and
+          budget["max_request_bytes"] <= 1048576 and budget["max_chunks"] <= 128,
+          "resource budget refused")
+
+
+def _resource_bounds(inventory, blobs, budget):
+    # Refuse before hashing, JSON/hex duplication, UTF8 boundary arrays or packing.
+    _need(len(inventory["files"]) <= budget["max_files"] and len(blobs) <= 2 * budget["max_files"],
+          "resource files refused")
+    total_raw = 0
+    for raw in blobs.values():
+        _need(type(raw) is bytes, "blob type refused")
+        total_raw += len(raw)
+        _need(total_raw <= budget["max_total_bytes"], "resource bytes refused")
+    # Logical base/head bytes count EACH reference, even shared OIDs, to bound work.
+    logical = 0
+    for f in inventory["files"]:
+        _keys(f, "path old_path status base head")
+        for side in ("base", "head"):
+            if f[side] is not None:
+                _keys(f[side], "oid bytes sha256 mode")
+                _integer(f[side]["bytes"])
+                logical += f[side]["bytes"]
+                _need(logical <= budget["max_total_bytes"], "resource bytes refused")
+
+
 def _validate(inventory, blobs, budget):
     _keys(inventory, "schema identity compare_file_count files dependencies")
-    _need(type(inventory["schema"]) is int and inventory["schema"] == 1, "schema refused")
+    _need(type(inventory["schema"]) is int and inventory["schema"] == 2, "schema refused")
     _identity(inventory["identity"])
-    _keys(budget, "max_request_bytes max_chunks overlap_bytes")
-    _integer(budget["max_request_bytes"], 1)
-    _integer(budget["max_chunks"], 1)
-    _integer(budget["overlap_bytes"], 1)
-    _need(budget["overlap_bytes"] < budget["max_request_bytes"], "budget refused")
+    _budget(budget)
     _need(type(blobs) is dict, "blob map refused")
     _need(type(inventory["files"]) is list and inventory["files"], "empty inventory refused")
+    _resource_bounds(inventory, blobs, budget)
     _integer(inventory["compare_file_count"], 1)
-    _need(inventory["compare_file_count"] == len(inventory["files"]), "compare count refused")
+    _need(inventory["compare_file_count"] == len(inventory["files"]), "self-asserted count mismatch")
     paths, used, old_paths = set(), set(), set()
     for f in inventory["files"]:
         _keys(f, "path old_path status base head")
@@ -147,11 +187,13 @@ def _validate(inventory, blobs, budget):
     _keys(deps, "status groups")
     _need(deps["status"] == "SUPPLIED_COMPLETE", "unresolved dependencies")
     _need(type(deps["groups"]) is list, "groups refused")
+    _need(len(deps["groups"]) <= budget["max_files"], "resource groups refused")
     grouped = []
     for group in deps["groups"]:
         _keys(group, "kind paths")
         _need(group["kind"] in ("ATOMIC", "STREAM"), "group kind refused")
         _need(type(group["paths"]) is list and group["paths"], "groups refused")
+        _need(len(grouped) + len(group["paths"]) <= budget["max_files"], "resource groups refused")
         for path in group["paths"]:
             _path(path)
         _need(group["kind"] != "STREAM" or len(group["paths"]) == 1, "stream closure refused")
@@ -170,10 +212,26 @@ def _items(files, paths):
     return items
 
 
+
+def _file_flags(f):
+    flags = []
+    if f["path"].startswith(".github/") or (f["old_path"] or "").startswith(".github/"):
+        flags.append("WORKFLOW")
+    if f["status"] in ("D", "R"):
+        flags.append({"D": "DELETION", "R": "RENAME"}[f["status"]])
+    if f["base"] is not None and f["head"] is not None and f["base"]["mode"] != f["head"]["mode"]:
+        flags.append("MODE_CHANGE")
+    return flags
+
+
+def _flagged_paths(inventory):
+    return [dict(path=f["path"], flags=_file_flags(f)) for f in sorted(inventory["files"], key=lambda f: f["path"]) if _file_flags(f)]
+
+
 def _request(inventory, blobs, chunk_id, items):
-    envelope = dict(schema=1, scope="MODEL_ONLY", qualification="NOT_ADMITTED", gate_wired=False,
+    envelope = dict(schema=2, scope="MODEL_ONLY", qualification="NOT_ADMITTED", gate_wired=False,
                     identity=inventory["identity"], chunk_id=chunk_id, item_count=len(items))
-    parts = [b"C003-INERT-BYTE-PLAN-1\n", _frame(_json(envelope))]
+    parts = [b"C003-INERT-BYTE-PLAN-2\n", _frame(_json(envelope))]
     files = {f["path"]: f for f in inventory["files"]}
     for item in items:
         f = files[item["path"]]
@@ -211,6 +269,7 @@ def _build(inventory, blobs, budget):
         if pending:
             _need(len(chunks) < budget["max_chunks"], "chunk count exceeded")
             request = _request(inventory, blobs, len(chunks), pending)
+            _need(len(request) <= cap, "flush byte cap refused")
             chunks.append(dict(id=len(chunks), items=list(pending), request_bytes=len(request),
                                request_sha256=_sha(request)))
             pending.clear()
@@ -256,9 +315,9 @@ def _build(inventory, blobs, budget):
                 _need(next_start > start, "overlap prevents progress")
                 start = next_start
     flush()
-    planned = dict(schema=1, scope="MODEL_ONLY", qualification="NOT_ADMITTED", gate_wired=False,
+    planned = dict(schema=2, scope="MODEL_ONLY", qualification="NOT_ADMITTED", gate_wired=False,
                    inventory=inventory, blobs={oid: raw.hex() for oid, raw in blobs.items()},
-                   budget=dict(budget), chunks=chunks)
+                   budget=dict(budget), chunks=chunks, flagged_paths=_flagged_paths(inventory))
     planned["plan_sha256"] = _sha(_json(planned))
     return planned
 
@@ -285,21 +344,48 @@ def _guarded(function, *args):
 
 
 def _check_plan(planned):
-    _keys(planned, "schema scope qualification gate_wired inventory blobs budget chunks plan_sha256")
+    _keys(planned, "schema scope qualification gate_wired inventory blobs budget chunks flagged_paths plan_sha256")
+    _need(type(planned["schema"]) is int and planned["schema"] == 2, "schema refused")
+    _need(planned["scope"] == "MODEL_ONLY" and planned["qualification"] == "NOT_ADMITTED" and
+          planned["gate_wired"] is False, "qualification refused")
+    _hex(planned["plan_sha256"], 64)
+    _need(type(planned["flagged_paths"]) is list and len(planned["flagged_paths"]) <= 128, "resource flags refused")
+    for row in planned["flagged_paths"]:
+        _keys(row, "path flags"); _path(row["path"])
+        _need(type(row["flags"]) is list and len(row["flags"]) <= 4 and
+              all(flag in ("WORKFLOW", "DELETION", "RENAME", "MODE_CHANGE") for flag in row["flags"]), "flags refused")
+    _budget(planned["budget"])
     _need(type(planned["blobs"]) is dict, "blob map refused")
+    _need(len(planned["blobs"]) <= 2 * planned["budget"]["max_files"], "resource files refused")
+    _need(type(planned["chunks"]) in (list, tuple) and len(planned["chunks"]) <= planned["budget"]["max_chunks"],
+          "resource chunks refused")
+    for chunk in planned["chunks"]:
+        _keys(chunk, "id items request_bytes request_sha256")
+        _need(type(chunk["items"]) in (list, tuple) and len(chunk["items"]) <= 2 * planned["budget"]["max_files"],
+              "resource items refused")
+        _integer(chunk["id"]); _integer(chunk["request_bytes"]); _hex(chunk["request_sha256"], 64)
+        _need(chunk["id"] < 128 and chunk["request_bytes"] <= 1048576, "resource chunk fields refused")
+        for item in chunk["items"]:
+            _keys(item, "path side oid start end"); _path(item["path"]); _hex(item["oid"], 40)
+            _need(item["side"] in ("base", "head"), "side refused")
+            _integer(item["start"]); _integer(item["end"])
+            _need(item["start"] <= 2097152 and item["end"] <= 2097152, "resource range refused")
+    hex_total = 0
     blobs = {}
     for oid, value in planned["blobs"].items():
         _hex(oid, 40)
-        _need(type(value) is str and len(value) % 2 == 0 and re.fullmatch("[0-9a-f]*", value) is not None,
-              "blob hex refused")
+        _need(type(value) is str and len(value) % 2 == 0, "blob hex refused")
+        hex_total += len(value)
+        _need(hex_total <= 2 * planned["budget"]["max_total_bytes"], "resource bytes refused")
+        _need(re.fullmatch("[0-9a-f]*", value) is not None, "blob hex refused")
         blobs[oid] = bytes.fromhex(value)
     expected = _build(planned["inventory"], blobs, planned["budget"])
     _need(_json(expected) == _json(planned), "plan binding refused")
-    return blobs
+    return expected, blobs
 
 
 def _serialize(planned, chunk_id):
-    blobs = _check_plan(planned)
+    planned, blobs = _check_plan(planned)
     _integer(chunk_id)
     _need(chunk_id < len(planned["chunks"]), "chunk refused")
     return _request(planned["inventory"], blobs, chunk_id, planned["chunks"][chunk_id]["items"])
@@ -310,6 +396,94 @@ def serialize(planned, chunk_id):
     return _guarded(_serialize, planned, chunk_id)
 
 
+
+def _coverage_proof(p, blobs):
+    """Independent interval/request proof: deliberately never calls _build/_request.
+
+    Equality with a second planner invocation is NOT this proof. Required sides,
+    raw-range bytes, framing, caps and intervals are derived independently here.
+    The JSON primitive and digest primitive are shared, not planner control flow.
+    """
+    inv = p["inventory"]
+    required, ranges, locations = {}, {}, {}
+    files = {f["path"]: f for f in inv["files"]}
+    for f in inv["files"]:
+        sides = {"A": ("head",), "D": ("base",), "M": ("base", "head"), "R": ("base", "head")}[f["status"]]
+        for side in sides:
+            key = (f["path"], side)
+            required[key] = f[side]
+            ranges[key], locations[key] = [], set()
+    _need(type(p["chunks"]) is list and 0 < len(p["chunks"]) <= p["budget"]["max_chunks"],
+          "independent chunks refused")
+    seen = set()
+    def frame(value):
+        return str(len(value)).encode("ascii") + b":" + value + b","
+    for ordinal, chunk in enumerate(p["chunks"]):
+        _keys(chunk, "id items request_bytes request_sha256")
+        _integer(chunk["id"])
+        _need(chunk["id"] == ordinal, "independent chunk order refused")
+        _need(type(chunk["items"]) is list and chunk["items"], "independent items refused")
+        envelope = dict(schema=2, scope="MODEL_ONLY", qualification="NOT_ADMITTED", gate_wired=False,
+                        identity=inv["identity"], chunk_id=ordinal, item_count=len(chunk["items"]))
+        parts = [b"C003-INERT-BYTE-PLAN-2\n", frame(_json(envelope))]
+        for item in chunk["items"]:
+            _keys(item, "path side oid start end")
+            _path(item["path"])
+            _need(type(item["side"]) is str, "independent side refused")
+            key = (item["path"], item["side"])
+            _need(key in required, "independent foreign item refused")
+            desc = required[key]
+            _need(item["oid"] == desc["oid"], "independent blob refused")
+            _integer(item["start"]); _integer(item["end"])
+            start, end, size = item["start"], item["end"], desc["bytes"]
+            _need(0 <= start <= end <= size and (start < end or size == 0), "independent range refused")
+            marker = (key, start, end)
+            _need(marker not in seen, "independent duplicate range refused")
+            seen.add(marker); ranges[key].append((start, end)); locations[key].add(ordinal)
+            value = blobs[desc["oid"]][start:end]
+            utf8 = True
+            try:
+                value.decode("utf-8", errors="strict")
+            except UnicodeDecodeError:
+                utf8 = False
+            _need(utf8, "independent utf8 range refused")
+            f = files[item["path"]]
+            flags = []
+            if f["path"].startswith(".github/") or (f["old_path"] or "").startswith(".github/"):
+                flags.append("WORKFLOW")
+            if f["status"] in ("D", "R"):
+                flags.append({"D": "DELETION", "R": "RENAME"}[f["status"]])
+            if f["base"] is not None and f["head"] is not None and f["base"]["mode"] != f["head"]["mode"]:
+                flags.append("MODE_CHANGE")
+            header = dict(item, old_path=f["old_path"], status=f["status"], mode=desc["mode"],
+                          size=size, sha256=desc["sha256"], disposition="REVIEWED_RAW", flags=flags)
+            parts.extend((frame(_json(header)), frame(value)))
+        request = b"".join(parts)
+        _need(len(request) <= p["budget"]["max_request_bytes"], "independent byte cap refused")
+        _integer(chunk["request_bytes"])
+        _hex(chunk["request_sha256"], 64)
+        _need(chunk["request_bytes"] == len(request) and chunk["request_sha256"] == _sha(request),
+              "independent request pin refused")
+    _need(all(ranges.values()), "independent side coverage refused")
+    for key, intervals in ranges.items():
+        size = required[key]["bytes"]
+        if size == 0:
+            _need(intervals == [(0, 0)], "independent empty coverage refused")
+            continue
+        covered = 0
+        for index, (start, end) in enumerate(sorted(intervals)):
+            _need(start <= covered, "independent interval coverage refused")
+            if index:
+                _need(covered - start >= p["budget"]["overlap_bytes"] and end > covered,
+                      "independent overlap refused")
+            covered = end
+        _need(covered == size, "independent interval coverage refused")
+    for group in inv["dependencies"]["groups"]:
+        if group["kind"] == "ATOMIC":
+            chunks = {n for key in required if key[0] in group["paths"] for n in locations[key]}
+            _need(len(chunks) == 1, "independent atomic closure refused")
+
+
 def verify(ledger, inventory):
     """Validate an ordered STUB ledger, never an actual security-review result.
 
@@ -318,13 +492,17 @@ def verify(ledger, inventory):
     """
     reason = None
     findings = []
+    flagged_paths = None
     try:
         _keys(ledger, "schema plan results current_head")
-        _need(type(ledger["schema"]) is int and ledger["schema"] == 1, "schema refused")
+        _need(type(ledger["schema"]) is int and ledger["schema"] == 2, "schema refused")
         p = ledger["plan"]
-        blobs = _check_plan(p)
+        p, blobs = _check_plan(p)
         expected = _build(inventory, blobs, p["budget"])
         _need(_json(expected) == _json(p), "inventory binding refused")
+        p = expected
+        _coverage_proof(p, blobs)
+        flagged_paths = p["flagged_paths"]
         _need(ledger["current_head"] == inventory["identity"]["head"], "head moved")
         _need(type(ledger["results"]) is list and len(ledger["results"]) == len(p["chunks"]),
               "result count refused")
@@ -365,7 +543,8 @@ def verify(ledger, inventory):
         reason = str(error)
     except (TypeError, ValueError, KeyError, OverflowError, RecursionError):
         reason = "malformed ledger"
-    return dict(ok=reason is None, reasons=[] if reason is None else [reason],
+    return dict(schema=2, ok=reason is None, reasons=[] if reason is None else [reason],
                 scope="MODEL_ONLY", qualification="NOT_ADMITTED", gate_wired=False,
                 security_review_completed=False, provider_verified=False,
-                coverage="SYNTHETIC_BYTES_ONLY", stub_findings=findings if reason is None else [])
+                coverage="SYNTHETIC_BYTES_ONLY", stub_findings=findings if reason is None else None,
+                flagged_paths=flagged_paths if reason is None else None)
