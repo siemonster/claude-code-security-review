@@ -15,6 +15,7 @@ _spec.loader.exec_module(contract)
 
 PLANNER = "5433860d497a863f6e0c56a27e8b4f10131e1fd0"
 ACQUISITION = "a739fd5901eefd055e89337ff6092559f5fca4ed"
+HARDENED = "a3b4ab9eb97e1d29b3eac52c1837f7d5a6307ece"
 
 
 def canonical(value, ascii_only=False):
@@ -121,6 +122,7 @@ def render_frame(plan, index):
 
 
 def example(chunk_count=1, *, case=None, repository="synthetic/example", edit_plan=None,
+            planner_revision=PLANNER, edit_binding=None, edit_acquisition=None, edit_hashed_plan=None,
             **limit_overrides):
     """Compose source-shaped fixtures and seal layers independently of the evaluator.
 
@@ -179,6 +181,8 @@ def example(chunk_count=1, *, case=None, repository="synthetic/example", edit_pl
         ),
         verified_objects=sorted([roots["base_tip"], roots["head"], *blobs]),
     )
+    if edit_acquisition is not None:
+        edit_acquisition(acquisition)
     caller = dict(
         scope="INJECTED_SYNTHETIC", source="CALLER_ASSERTED_UNVERIFIED",
         claimed_status="SUPPLIED_COMPLETE", groups=groups,
@@ -186,7 +190,7 @@ def example(chunk_count=1, *, case=None, repository="synthetic/example", edit_pl
     )
     identity = dict(
         repository=roots["repository"], pr=1, base=roots["comparison_base"], head=roots["head"],
-        planner_sha=PLANNER, prompt_sha256=digest(prompt), policy_sha256=digest(policy),
+        planner_sha=planner_revision, prompt_sha256=digest(prompt), policy_sha256=digest(policy),
         model=model, run_id="synthetic-run", attempt=1, challenge="3"*64,
     )
     plan = dict(
@@ -207,19 +211,23 @@ def example(chunk_count=1, *, case=None, repository="synthetic/example", edit_pl
     frames = [render_frame(plan, i) for i in range(chunk_count)]
     for chunk, frame in zip(plan["chunks"], frames):
         chunk.update(request_bytes=len(frame), request_sha256=digest(frame))
+    if edit_hashed_plan is not None:
+        edit_hashed_plan(plan)
     plan["plan_sha256"] = digest(canonical(plan, True))
     current = dict(roots, workflow_run_id=identity["run_id"], workflow_attempt=1)
     requests, receipts, evaluations, trace = [], [], [], []
     for index, (frame, chunk) in enumerate(zip(frames, plan["chunks"])):
         binding = dict(
             current, acquisition_manifest_sha256=digest(canonical(acquisition)),
-            acquisition_source_sha=ACQUISITION, planner_source_sha=PLANNER, plan_schema=3,
+            acquisition_source_sha=ACQUISITION, planner_source_sha=planner_revision, plan_schema=3,
             plan_sha256=plan["plan_sha256"], chunk_id=index, chunk_count=chunk_count,
             run_challenge=identity["challenge"], prompt_sha256=digest(prompt), policy_sha256=digest(policy),
             config_sha256=digest(canonical(config)), roots_authenticated=False,
             acquisition_closure="NOT_EVALUATED", plan_dependency_assertion="CALLER_ASSERTED_UNVERIFIED",
             caller_dependency_assertion_sha256=digest(canonical(caller)), schema3_identity_model=model,
         )
+        if edit_binding is not None:
+            edit_binding(binding, index)
         by_path = {f["path"]: f for f in files}
         ranges = [dict(item, old_path=by_path[item["path"]]["old_path"],
                        blob_sha256=by_path[item["path"]][item["side"]]["sha256"])
@@ -949,6 +957,186 @@ class CompactContractTests(unittest.TestCase):
         expected["selected_attempt_ids"] = [second["attempt_id"]]
         expected["raw_findings"][0]["attempt_id"] = second["attempt_id"]
         self.assertEqual(contract.evaluate_common_artifact_bundle(bundle), expected)
+
+
+class HardenedEntryTests(unittest.TestCase):
+    def evaluate(self, bundle):
+        return contract.evaluate_hardened_common_artifact_bundle(bundle)
+
+    def passing(self, **kwargs):
+        bundle, expected = compact_example(planner_revision=HARDENED, **kwargs)
+        self.assertEqual(self.evaluate(bundle), expected)
+        return bundle, expected
+
+    def test_M03_hardened_empty_complete_aggregate(self):
+        bundle, expected = compact_example(planner_revision=HARDENED)
+        evaluation = expected["attempts"][0]
+        evaluation["model_result"].update(outcome="no_findings", findings=[])
+        replace_model(bundle, evaluation)
+        expected.update(raw_findings=[], raw_finding_count=0, unique_finding_count=0)
+        self.assertEqual(self.evaluate(bundle), expected)
+        self.assertEqual(len(expected), 21)
+
+    def test_M04_hardened_findings_and_full_layout_cascade(self):
+        old, old_expected = compact_example()
+        new, expected = compact_example(planner_revision=HARDENED)
+        before = copy.deepcopy(new)
+        self.assertEqual(contract.evaluate_common_artifact_bundle(old), old_expected)
+        self.assertEqual(self.evaluate(new), expected)
+        self.assertEqual(new, before)
+        self.assertEqual(len(expected), 21)
+        for key in ("owner_config_hex", "acquisition_manifest_hex", "prompt_hex", "policy_hex",
+                    "caller_dependency_assertion_hex"):
+            self.assertEqual(old["common_artifacts"][key], new["common_artifacts"][key])
+        a, b = old["requests"][0], new["requests"][0]
+        self.assertNotEqual(old["common_artifacts"]["plan_hex"], new["common_artifacts"]["plan_hex"])
+        self.assertNotEqual(a["split_artifacts"]["framed_request_hex"], b["split_artifacts"]["framed_request_hex"])
+        self.assertNotEqual(a["binding"]["plan_sha256"], b["binding"]["plan_sha256"])
+        for key in ("framed_request_sha256", "chunk_challenge", "body_hex", "body_sha256", "stable_request_id"):
+            self.assertNotEqual(a[key], b[key])
+        for key in ("framed_request_bytes", "body_bytes"):
+            self.assertEqual(a[key], b[key])
+        self.assertNotEqual(old["attempts"][0]["attempt_id"], new["attempts"][0]["attempt_id"])
+
+    def test_M05_wrong_outer_L_at_hardened_entry_is_G0(self):
+        self.passing()
+        bundle, _ = compact_example(planner_revision=HARDENED,
+                                    edit_binding=lambda b, i: b.update(planner_source_sha=PLANNER))
+        self.assertEqual(self.evaluate(bundle), compact_early("INPUT_SHAPE"))
+
+    def test_hardened_raw_duplicates_and_unapproved_filter_keep_full_trace(self):
+        bundle, expected = compact_example(planner_revision=HARDENED)
+        evaluation = expected["attempts"][0]
+        finding = evaluation["model_result"]["findings"][0]
+        evaluation["model_result"]["findings"] = [copy.deepcopy(finding), copy.deepcopy(finding)]
+        replace_model(bundle, evaluation)
+        expected["raw_findings"] = [dict(expected["raw_findings"][0], model_finding_index=i) for i in range(2)]
+        expected.update(raw_finding_count=2, unique_finding_count=1)
+        self.assertEqual(self.evaluate(bundle), expected)
+        bundle, expected = compact_example(planner_revision=HARDENED)
+        evaluation = expected["attempts"][0]
+        evaluation["model_result"]["findings"][0]["filter_reason"] = "unapproved"
+        replace_model(bundle, evaluation)
+        evaluation.update(decision="REFUSED", reasons=["FILTER_UNAPPROVED"])
+        self.assertEqual(self.evaluate(bundle), refused(expected, "FILTER_UNAPPROVED"))
+
+    def test_M06_M14_legacy_layout_outer_pin_refusals_have_nineteen_keys(self):
+        control, expected = example()
+        self.assertEqual(contract.evaluate_injected_bundle(control), expected)
+        for pin in (HARDENED, "9"*40):
+            with self.subTest(pin=pin):
+                bundle, _ = example(edit_binding=lambda b, i: b.update(planner_source_sha=pin))
+                self.assertNotIn("bundle_format", bundle)
+                self.assertEqual(contract.evaluate_injected_bundle(bundle), early("INPUT_SHAPE"))
+                self.assertEqual(len(early("INPUT_SHAPE")), 19)
+
+    def test_M06_M14_compact_L_outer_pin_refusals_have_twenty_one_keys(self):
+        control, expected = compact_example()
+        self.assertEqual(contract.evaluate_common_artifact_bundle(control), expected)
+        for pin in (HARDENED, "9"*40):
+            with self.subTest(pin=pin):
+                bundle, _ = compact_example(edit_binding=lambda b, i: b.update(planner_source_sha=pin))
+                self.assertEqual(contract.evaluate_common_artifact_bundle(bundle), compact_early("INPUT_SHAPE"))
+
+    def test_M07_inner_L_fully_rebound_is_G2_not_a_later_hash_error(self):
+        control, expected = compact_example()
+        self.assertEqual(contract.evaluate_common_artifact_bundle(control), expected)
+        # H outer / L inner: every downstream frame/hash/body/ID is rebuilt.
+        bundle, _ = compact_example(planner_revision=HARDENED,
+                                    edit_plan=lambda p: p["inventory"]["identity"].update(planner_sha=PLANNER))
+        self.assertEqual(self.evaluate(bundle), compact_early("BINDING", bundle))
+        self.passing()
+
+    def test_M07_M14_unknown_inner_and_outer_pins_are_phase_specific(self):
+        self.passing()
+        inner, _ = compact_example(planner_revision=HARDENED,
+                                   edit_plan=lambda p: p["inventory"]["identity"].update(planner_sha="9"*40))
+        self.assertEqual(self.evaluate(inner), compact_early("BINDING", inner))
+        outer, _ = compact_example(planner_revision=HARDENED,
+                                   edit_binding=lambda b, i: b.update(planner_source_sha="9"*40))
+        self.assertEqual(self.evaluate(outer), compact_early("INPUT_SHAPE"))
+
+    def test_M08_M09_source_and_configuration_first_failure(self):
+        inner, _ = compact_example(planner_revision=HARDENED,
+                                   edit_plan=lambda p: p["inventory"]["identity"].update(planner_sha=PLANNER))
+        inner["config"] = None
+        self.assertEqual(self.evaluate(inner), compact_early("CONFIG_UNQUALIFIED"))
+        outer, _ = compact_example(planner_revision=HARDENED,
+                                   edit_binding=lambda b, i: b.update(planner_source_sha=PLANNER))
+        outer["config"] = None
+        self.assertEqual(self.evaluate(outer), compact_early("INPUT_SHAPE"))
+
+    def test_M10_stale_plan_hash_and_rehashed_stale_chunk_hash(self):
+        self.passing()
+        bundle, _ = compact_example(planner_revision=HARDENED)
+        plan = json.loads(bytes.fromhex(bundle["common_artifacts"]["plan_hex"]))
+        plan["inventory"]["identity"]["planner_sha"] = PLANNER
+        bundle["common_artifacts"]["plan_hex"] = canonical(plan, True).hex()
+        self.assertEqual(self.evaluate(bundle), compact_early("BINDING", bundle))
+        old, _ = compact_example()
+        old_plan = json.loads(bytes.fromhex(old["common_artifacts"]["plan_hex"]))
+        stale_hash = old_plan["chunks"][0]["request_sha256"]
+        bundle, _ = compact_example(planner_revision=HARDENED,
+                                    edit_hashed_plan=lambda p: p["chunks"][0].update(request_sha256=stale_hash))
+        self.assertEqual(self.evaluate(bundle), compact_early("BINDING", bundle))
+
+    def test_M11_L_receipt_cannot_associate_with_H_request(self):
+        bundle, _ = self.passing()
+        old, old_expected = compact_example()
+        self.assertEqual(contract.evaluate_common_artifact_bundle(old), old_expected)
+        bundle["attempts"] = copy.deepcopy(old["attempts"])
+        self.assertEqual(self.evaluate(bundle), compact_early("BINDING", bundle))
+
+    def test_M12_stale_current_roots_run_and_attempt_are_G3(self):
+        for key, value in (("head", "8"*40), ("workflow_run_id", "other-synthetic-run"), ("workflow_attempt", 2)):
+            with self.subTest(field=key):
+                bundle, _ = self.passing()
+                bundle["current_identity"][key] = value
+                self.assertEqual(self.evaluate(bundle), compact_early("STALE", bundle))
+
+    def test_M13_mixed_outer_revision_is_rebound_one_field(self):
+        self.passing(chunk_count=2)
+        def one_outer(binding, index):
+            if index == 1:
+                binding["planner_source_sha"] = PLANNER
+        bundle, _ = compact_example(2, planner_revision=HARDENED, edit_binding=one_outer)
+        self.assertEqual(self.evaluate(bundle), compact_early("INPUT_SHAPE"))
+
+    def test_M15_M16_A_and_false_root_literal_stay_fixed(self):
+        self.passing()
+        for field, value in (("acquisition_source_sha", HARDENED), ("roots_authenticated", True)):
+            with self.subTest(field=field):
+                bundle, _ = compact_example(planner_revision=HARDENED,
+                                            edit_binding=lambda b, i: b.update({field: value}))
+                self.assertEqual(self.evaluate(bundle), compact_early("INPUT_SHAPE"))
+
+    def test_M17_acquisition_false_literal_rebuilds_artifact_digest(self):
+        self.passing()
+        bundle, _ = compact_example(planner_revision=HARDENED,
+                                    edit_acquisition=lambda a: a.update(acquisition_authenticated=True))
+        self.assertEqual(self.evaluate(bundle), compact_early("BINDING", bundle))
+
+    def test_M18_forged_consistent_world_remains_unqualified(self):
+        bundle, expected = self.passing(repository="forged/consistent-world")
+        self.assertEqual(self.evaluate(bundle), expected)
+        for key in ("gate_wired", "security_review_completed", "provider_verified", "acquisition_authenticated"):
+            self.assertIs(expected[key], False)
+        self.assertIsNone(expected["effective_findings_count"])
+        acquisition = json.loads(bytes.fromhex(bundle["common_artifacts"]["acquisition_manifest_hex"]))
+        self.assertEqual(acquisition["trust"], "CALLER_SUPPLIED_UNAUTHENTICATED_UNFRESH")
+        self.assertEqual(acquisition["closure"], "NOT_EVALUATED")
+
+    def test_optional_old_outer_L_inner_H_and_hardened_legacy_layout(self):
+        for build, evaluate, shell in ((example, contract.evaluate_injected_bundle, early),
+                                       (compact_example, contract.evaluate_common_artifact_bundle, compact_early)):
+            control, expected = build()
+            self.assertEqual(evaluate(control), expected)
+            bundle, _ = build(edit_plan=lambda p: p["inventory"]["identity"].update(planner_sha=HARDENED))
+            self.assertEqual(evaluate(bundle), shell("BINDING", bundle))
+        legacy, _ = example(planner_revision=HARDENED)
+        self.assertEqual(self.evaluate(legacy), compact_early("INPUT_SHAPE"))
+        legacy["requests"][0]["binding"]["planner_source_sha"] = PLANNER
+        self.assertEqual(self.evaluate(legacy), compact_early("INPUT_SHAPE"))
 
 
 if __name__ == "__main__":
