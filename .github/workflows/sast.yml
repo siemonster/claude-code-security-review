@@ -22,4 +22,5 @@ jobs:
           upload-results: true
           exclude-directories: "tests/vulnerable"
           claude-api-key: ${{ secrets.CLAUDE_API_KEY }}
+          claude-code-oauth-token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           run-every-commit: true
