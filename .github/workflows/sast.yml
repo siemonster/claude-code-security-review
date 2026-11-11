@@ -18,8 +18,11 @@ jobs:
 
       - uses: ./ # Points directly to action.yml
         with:
-          comment-pr: true
-          upload-results: true
+          # This repository is public, so its review comments and artifacts are too.
+          # The scan runs with a Claude credential; keep its output out of both.
+          comment-pr: false
+          upload-results: false
           exclude-directories: "tests/vulnerable"
           claude-api-key: ${{ secrets.CLAUDE_API_KEY }}
+          claude-code-oauth-token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           run-every-commit: true
