@@ -38,6 +38,7 @@ import re
 
 
 _PLANNER = "5433860d497a863f6e0c56a27e8b4f10131e1fd0"
+_HARDENED_PLANNER = "a3b4ab9eb97e1d29b3eac52c1837f7d5a6307ece"
 _ACQUISITION = "a739fd5901eefd055e89337ff6092559f5fca4ed"
 _VERSION = "2026-10-21"
 _MAX_INTEGER = 9007199254740991
@@ -270,7 +271,7 @@ def _wire_shape(wire, reason, streamed_strings=False):
     _text(text["text"], reason, streamed=streamed_strings)
 
 
-def _request_shape(request, reason, compact=False):
+def _request_shape(request, reason, compact=False, expected_planner=_PLANNER):
     _keys(request, "binding ranges framed_request_sha256 framed_request_bytes chunk_challenge "
           "stable_request_id method url public_headers body_hex body_bytes body_sha256 wire_request "
           "split_artifacts declared_input_token_bound declared_cost_bound_units", reason)
@@ -284,7 +285,7 @@ def _request_shape(request, reason, compact=False):
           "roots_authenticated schema3_identity_model", reason)
     _identity_shape({key: binding[key] for key in _CURRENT.split()}, reason)
     _fixed(binding, reason, acquisition_closure="NOT_EVALUATED", acquisition_source_sha=_ACQUISITION,
-           planner_source_sha=_PLANNER, roots_authenticated=False, plan_schema=3,
+           planner_source_sha=expected_planner, roots_authenticated=False, plan_schema=3,
            plan_dependency_assertion="CALLER_ASSERTED_UNVERIFIED")
     for key in hashes.split():
         _hex(binding[key], reason, 64)
@@ -365,7 +366,7 @@ def _budget_shape(budget, reason):
     _choice(budget["reservation_state"], ("UNQUALIFIED", "RESERVED", "EXHAUSTED"), reason)
 
 
-def _raw_shape(bundle, compact=False):
+def _raw_shape(bundle, compact=False, expected_planner=_PLANNER):
     reason = "INPUT_SHAPE"
     _keys(bundle, "attempts budget_receipt current_identity requests"
           + (" bundle_format common_artifacts" if compact else ""), reason, "config")
@@ -379,7 +380,7 @@ def _raw_shape(bundle, compact=False):
     _array(bundle["requests"], reason)
     _array(bundle["attempts"], reason)
     for request in bundle["requests"]:
-        _request_shape(request, reason, compact)
+        _request_shape(request, reason, compact, expected_planner)
     for receipt in bundle["attempts"]:
         _receipt_shape(receipt, reason)
     _budget_shape(bundle["budget_receipt"], reason)
@@ -547,7 +548,7 @@ def _caller_groups(assertion, dependencies, paths, reason):
           and _canonical(groups) == _canonical(dependencies["groups"]), reason)
 
 
-def _plan_metadata(plan, acquisition, assertion, count, limits, reason):
+def _plan_metadata(plan, acquisition, assertion, count, limits, reason, expected_planner=_PLANNER):
     _keys(plan, "schema scope qualification gate_wired inventory blobs budget chunks flagged_paths plan_sha256", reason)
     _fixed(plan, reason, schema=3, scope="MODEL_ONLY", qualification="NOT_ADMITTED", gate_wired=False)
     _hex(plan["plan_sha256"], reason, 64)
@@ -567,7 +568,7 @@ def _plan_metadata(plan, acquisition, assertion, count, limits, reason):
     _keys(identity, "repository pr base head planner_sha prompt_sha256 policy_sha256 model run_id attempt challenge", reason)
     roots = acquisition["identity"]
     _fixed(identity, reason, repository=roots["repository"], pr=roots["pr"], base=roots["comparison_base"],
-           head=roots["head"], planner_sha=_PLANNER)
+           head=roots["head"], planner_sha=expected_planner)
     for key in ("prompt_sha256", "policy_sha256", "challenge"):
         _hex(identity[key], reason, 64)
     for key in ("model", "run_id"):
@@ -654,7 +655,7 @@ def _plan_frames(plan, identity, files, raw_blobs, flags, limits, reason):
     return frames
 
 
-def _artifact_metadata(split, config, count, limits, reason):
+def _artifact_metadata(split, config, count, limits, reason, expected_planner=_PLANNER):
     cap = limits["max_artifact_bytes"]
     common = {key: _binary(value, cap, reason) for key, value in split.items()
               if key != "framed_request_hex"}
@@ -663,7 +664,7 @@ def _artifact_metadata(split, config, count, limits, reason):
     plan = _artifact(common["plan_hex"], limits, reason, ascii_only=True)
     assertion = _artifact(common["caller_dependency_assertion_hex"], limits, reason)
     _acquisition(acquisition, limits, reason)
-    identity, files, raw_blobs, flags = _plan_metadata(plan, acquisition, assertion, count, limits, reason)
+    identity, files, raw_blobs, flags = _plan_metadata(plan, acquisition, assertion, count, limits, reason, expected_planner)
     return common, acquisition, plan, identity, files, raw_blobs, flags
 
 
@@ -936,12 +937,12 @@ def _compact_data_parts(binding, ranges, challenge, frame_size, frame_parts):
     yield b","
 
 
-def _compact_bound_requests(requests, split, config, limits):
+def _compact_bound_requests(requests, split, config, limits, expected_planner=_PLANNER):
     reason = "BINDING"
     count = len(requests)
     _need(1 <= count <= min(limits["max_chunks"], 128), reason)
     common, acquisition, plan, identity, files, raw_blobs, flags = _artifact_metadata(
-        split, config, count, limits, reason,
+        split, config, count, limits, reason, expected_planner,
     )
     flags, projected = _compact_policy(plan, files, raw_blobs, flags, limits, reason)
     frame_limit = min(plan["budget"]["max_request_bytes"], limits["max_request_bytes"], _FRAME_LIMIT)
@@ -1289,20 +1290,20 @@ def _shell():
     )
 
 
-def _evaluate_bundle(bundle, compact):
+def _evaluate_bundle(bundle, compact, expected_planner=_PLANNER):
     """Shared G1 and G3-through-P4; public functions explicitly select G0/G2."""
     result = _shell()
     if compact:
         result.update(result_format=2, common_artifacts=None)
     try:
         # G0 owns the static raw shapes. Missing config is deliberately G1.
-        _raw_shape(bundle, compact)
+        _raw_shape(bundle, compact, expected_planner)
         config = bundle.get("config")
         limits = _configuration(config)
         result["config_sha256"] = _digest(_canonical(config))
         requests, budget = bundle["requests"], bundle["budget_receipt"]
         if compact:
-            _compact_bound_requests(requests, bundle["common_artifacts"], config, limits)
+            _compact_bound_requests(requests, bundle["common_artifacts"], config, limits, expected_planner)
         else:
             _bound_requests(requests, config, limits)
         for request in requests:
@@ -1346,3 +1347,8 @@ def evaluate_injected_bundle(bundle):
 def evaluate_common_artifact_bundle(bundle):
     """Explicit strict r3 input2/output2; common artifacts once, no I/O or wiring."""
     return _evaluate_bundle(bundle, True)
+
+
+def evaluate_hardened_common_artifact_bundle(bundle):
+    """Explicit strict compact H reference; never source-execution authentication."""
+    return _evaluate_bundle(bundle, True, _HARDENED_PLANNER)
