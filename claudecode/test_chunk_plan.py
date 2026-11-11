@@ -718,5 +718,182 @@ class PlannerTests(unittest.TestCase):
         with self.assertRaisesRegex(planner.Refused,"^schema refused$"):planner.serialize(p,0)
 
 
+def literal_bound_plan(pr=1, attempt=1):
+    """Independent one-chunk schema3 data, including formerly valid over-cap IDs.
+
+    No production builder, renderer, private helper or cap constant is used.
+    planner_sha remains the existing caller-asserted fixture value, not provenance.
+    """
+    inv, blobs, budget = fixture()
+    inv["identity"].update(pr=pr, attempt=attempt)
+    desc = inv["files"][0]["head"]
+    item = dict(path="hello.txt", side="head", oid=desc["oid"], start=0, end=6)
+    envelope = dict(schema=3, scope="MODEL_ONLY", qualification="NOT_ADMITTED", gate_wired=False,
+                    identity=copy.deepcopy(inv["identity"]), chunk_id=0, item_count=1)
+    header = dict(item, old_path=None, status="A", mode="100644", size=6,
+                  sha256=desc["sha256"], disposition="REVIEWED_RAW", flags=[])
+    def framed(value):
+        return str(len(value)).encode("ascii") + b":" + value + b","
+    def canonical(value):
+        return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+                          allow_nan=False).encode("ascii")
+    request = (b"C003-INERT-BYTE-PLAN-3\n" + framed(canonical(envelope)) +
+               framed(canonical(header)) + framed(b"hello\n"))
+    p = dict(schema=3, scope="MODEL_ONLY", qualification="NOT_ADMITTED", gate_wired=False,
+             inventory=copy.deepcopy(inv), blobs={desc["oid"]: b"hello\n".hex()}, budget=budget,
+             chunks=[dict(id=0, items=[item], request_bytes=len(request),
+                          request_sha256=hashlib.sha256(request).hexdigest())], flagged_paths=[])
+    p["plan_sha256"] = hashlib.sha256(canonical(p)).hexdigest()
+    return inv, blobs, budget, p, request
+
+
+class PlannerBoundTests(unittest.TestCase):
+    def aggregate(self, *, reason=None, findings=None):
+        return dict(schema=3, ok=reason is None, reasons=[] if reason is None else [reason],
+                    scope="MODEL_ONLY", qualification="NOT_ADMITTED", gate_wired=False,
+                    security_review_completed=False, provider_verified=False,
+                    coverage="SYNTHETIC_BYTES_ONLY", stub_findings=None if reason else (findings or []),
+                    flagged_paths=None if reason else [])
+
+    def finding(self, path="hello.txt", filter_reason=None):
+        return dict(path=path, side="head", start=0, end=5, severity="P2", rule="fixture",
+                    message="synthetic finding", filter_reason=filter_reason)
+
+    def thirty_three(self):
+        inv, blobs, budget = fixture()
+        inv["files"][0]["path"] = "part/00.txt"
+        inv["dependencies"]["groups"][0] = dict(kind="ATOMIC", paths=["part/00.txt"])
+        for n in range(1, 33):
+            add_file(inv, blobs, "part/%02d.txt" % n, b"hello\n", kind="ATOMIC")
+        budget.update(max_request_bytes=1000, max_chunks=33)
+        p = planner.plan(inv, blobs, budget)
+        self.assertEqual(len(p["chunks"]), 33)
+        self.assertEqual([c["items"][0]["path"] for c in p["chunks"]],
+                         ["part/%02d.txt" % n for n in range(33)])
+        self.assertTrue(all(len(c["items"]) == 1 and c["request_bytes"] <= 1000 for c in p["chunks"]))
+        self.assertEqual(planner.verify(ledger_for(p), inv), self.aggregate())
+        return inv, p
+
+    def test_five_independent_authored_preimages_and_surviving_outputs(self):
+        # Fixed source-spec pins from reviewed preparation, not candidate output.
+        cases = [
+            (1, 1, "7fae1e554ad3b242855a124682d54f46dbfc612949eb9ffffc327cb968626481", "1f32599a58adde0462f53ddaa50433954f0ff1862b41b4ca68bcdb4ee5cfec8f", True),
+            (2147483647, 1, "75bae8c42298716c55475046f02ae22109622c38c5029ef871fbe48563d2598c", "14170743152a0c472e77a6f78c26b534a8a49307282894fc1fcbafe1a8d48200", True),
+            (2147483648, 1, "9702a3c16c5c091b4c814d679fcaddcbe8f74be9a2a713aa80293b6b0f5706f4", "bc4239752598d6fa5cf6b692a12b8d3ffb8b919bb6334a37bcc72826180681cf", False),
+            (1, 1000000, "5fe9ba17ba24d3dc595372e647b22b338ff224fc564991cefb65d5d8c1e6f791", "d1be9ee14cdd16fff2e22f5ba72857624ce0afec84a5af35a319ce3c9f6c2eb4", True),
+            (1, 1000001, "31371c6a4a7680eff3be2a942fc2dc251ed168eb910ab0b82b4fa63ebd4bc72d", "0ac87c17f79c1b36bc84e6a288e1058f7f996db5ea8851154e0f622f675dd454", False),
+        ]
+        for pr, attempt, request_sha, plan_sha, survives in cases:
+            with self.subTest(pr=pr, attempt=attempt):
+                inv, blobs, budget, p, request = literal_bound_plan(pr, attempt)
+                self.assertEqual(hashlib.sha256(request).hexdigest(), request_sha)
+                self.assertEqual(p["plan_sha256"], plan_sha)
+                self.assertLess(len(request), budget["max_request_bytes"])
+                if survives:
+                    self.assertEqual(planner.plan(inv, blobs, budget), p)
+                    self.assertEqual(planner.serialize(p, 0), request)
+                    self.assertEqual(planner.verify(ledger_for(p), inv), self.aggregate())
+
+    def test_identity_upper_and_one_below_preserve_full_outputs(self):
+        for pr, attempt in [(2147483646, 1), (1, 999999), (2147483647, 1000000)]:
+            with self.subTest(pr=pr, attempt=attempt):
+                inv, blobs, budget, p, request = literal_bound_plan(pr, attempt)
+                self.assertEqual(planner.plan(inv, blobs, budget), p)
+                self.assertEqual(planner.serialize(p, 0), request)
+                self.assertEqual(planner.verify(ledger_for(p), inv), self.aggregate())
+
+    def test_overcap_literal_identity_refuses_all_public_entries(self):
+        for pr, attempt in [(2147483648, 1), (1, 1000001), (2147483648, 1000001)]:
+            with self.subTest(pr=pr, attempt=attempt):
+                inv, blobs, budget, p, _ = literal_bound_plan(pr, attempt)
+                for call in [lambda: planner.plan(inv, blobs, budget), lambda: planner.serialize(p, 0)]:
+                    with self.assertRaises(planner.Refused) as caught:
+                        call()
+                    self.assertEqual(str(caught.exception), "identity magnitude refused")
+                    self.assertIsNone(caught.exception.__context__)
+                    self.assertIsNone(caught.exception.__cause__)
+                self.assertEqual(planner.verify(ledger_for(p), inv), self.aggregate(reason="identity magnitude refused"))
+
+    def test_identity_magnitude_and_prior_minimum_failure_precedence(self):
+        for field in ["pr", "attempt"]:
+            for value in [True, False, 0, -1, 1.0, "1"]:
+                with self.subTest(field=field, value=value):
+                    inv, blobs, budget = fixture()
+                    inv["identity"][field] = value
+                    with self.assertRaisesRegex(planner.Refused, "^integer refused$"):
+                        planner.plan(inv, blobs, budget)
+        for pr, attempt in [(2147483648, True), (0, 1000001)]:
+            inv, blobs, budget = fixture(); inv["identity"].update(pr=pr, attempt=attempt)
+            with self.assertRaisesRegex(planner.Refused, "^integer refused$"):
+                planner.plan(inv, blobs, budget)
+        for pr, attempt in [(2147483648, 1), (1, 1000001)]:
+            inv, blobs, budget, p, _ = literal_bound_plan(pr, attempt)
+            inv["identity"]["head"] = "malformed-later-digest"
+            p["inventory"]["identity"]["head"] = inv["identity"]["head"]
+            with self.assertRaisesRegex(planner.Refused, "^identity magnitude refused$"):
+                planner.plan(inv, blobs, budget)
+            with self.assertRaisesRegex(planner.Refused, "^identity magnitude refused$"):
+                planner.serialize(p, 0)
+            self.assertEqual(planner.verify(ledger_for(p), inv), self.aggregate(reason="identity magnitude refused"))
+
+    def test_explicit_inventory_and_result_identity_cap_placement(self):
+        inv, _, _, p, _ = literal_bound_plan()
+        changed = copy.deepcopy(inv); changed["identity"]["pr"] = 2147483648
+        self.assertEqual(planner.verify(ledger_for(p), changed), self.aggregate(reason="identity magnitude refused"))
+        for field, value in [("pr", 2147483648), ("attempt", 1000001)]:
+            for later_bad in [False, True]:
+                ledger = ledger_for(p); identity = ledger["results"][0]["identity"]
+                identity[field] = value
+                if later_bad:
+                    identity["prompt_sha256"] = "later-malformed"
+                self.assertEqual(planner.verify(ledger, inv), self.aggregate(reason="identity magnitude refused"))
+        ledger = ledger_for(p); ledger["results"][0]["identity"]["attempt"] = 1000001
+        ledger["results"][0]["status"] = "FAILED"
+        self.assertEqual(planner.verify(ledger, inv), self.aggregate(reason="stub failed"))
+
+    def test_chunk_raw_count_boundaries_include_duplicate_filtered_rows(self):
+        inv, _, _, p, _ = literal_bound_plan()
+        for label in [None, "stub-filter-reason"]:
+            finding = self.finding(filter_reason=label)
+            for count in [0, 127, 128, 129]:
+                with self.subTest(label=label, raw_count=count):
+                    ledger = ledger_for(p); ledger["results"][0]["findings"] = [finding] * count
+                    expected = self.aggregate(reason="resource findings refused") if count == 129 else self.aggregate(findings=[finding] if count else [])
+                    self.assertEqual(planner.verify(ledger, inv), expected)
+
+    def test_thirty_three_chunk_under_cap_complete_aggregate(self):
+        self.thirty_three()
+
+    def test_valid_thirty_three_chunk_fixture_and_run_raw_count_boundary(self):
+        inv, p = self.thirty_three()
+        ledger = ledger_for(p)
+        expected_rows = [self.finding("part/%02d.txt" % n, "retained-filter-label") for n in range(32)]
+        for result, row in zip(ledger["results"], expected_rows):
+            result["findings"] = [row] * 128
+        self.assertEqual(sum(len(r["findings"]) for r in ledger["results"]), 4096)
+        self.assertTrue(all(len(r["findings"]) <= 128 for r in ledger["results"]))
+        self.assertEqual(planner.verify(ledger, inv), self.aggregate(findings=expected_rows))
+        ledger["results"][32]["findings"] = [self.finding("part/32.txt", "retained-filter-label")]
+        self.assertEqual(sum(len(r["findings"]) for r in ledger["results"]), 4097)
+        self.assertEqual(planner.verify(ledger, inv), self.aggregate(reason="resource findings refused"))
+        ledger["results"][32]["findings"] = [{}]
+        self.assertEqual(planner.verify(ledger, inv), self.aggregate(reason="resource findings refused"))
+
+    def test_count_refusal_preserves_earlier_checks_and_precedes_current_rows(self):
+        inv, _, _, p, _ = literal_bound_plan()
+        for change, reason in [
+                (lambda r: r.update(findings=[{}]*129), "resource findings refused"),
+                (lambda r: r.update(findings=[{}]*128), "schema refused"),
+                (lambda r: r.update(status="FAILED", findings=[{}]*129), "stub failed"),
+                (lambda r: r.update(request_sha256="0"*64, findings=[{}]*129), "result binding refused"),
+                (lambda r: r.update(findings={}), "findings refused")]:
+            ledger = ledger_for(p); change(ledger["results"][0])
+            self.assertEqual(planner.verify(ledger, inv), self.aggregate(reason=reason))
+        inv, p = self.thirty_three(); ledger = ledger_for(p)
+        ledger["results"][0]["findings"] = [{}]
+        ledger["results"][32]["findings"] = [self.finding("part/32.txt")] * 129
+        self.assertEqual(planner.verify(ledger, inv), self.aggregate(reason="schema refused"))
+
+
 if __name__ == "__main__":
     unittest.main()

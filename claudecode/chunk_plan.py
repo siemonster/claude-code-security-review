@@ -17,6 +17,13 @@ budgets; Python/JSON allocation multipliers, caller preallocation and every CPU
 or memory effect are not solved. Existing packing/rebuild costs remain bounded
 only within this intentionally small synthetic domain.
 
+Always-on synthetic identity ceilings are PR2147483647 and workflow attempt1000000.
+Stub findings are capped at128 raw sightings/chunk and4096/run before deduplication;
+filter-labelled and duplicate rows count. Above-ceiling inputs now refuse, even
+when a duplicate-heavy union would be small. These bounds do not contain caller
+allocation, whole-process memory or total execution time. planner_sha remains a
+caller assertion; a new implementation does not authenticate an old revision pin.
+
 Schema 3 (incompatible with schema1/2 inventory/plans/ledgers) supports A/M/D/R, regular UTF-8 blobs, and 100644/100755 modes. Modified
 and renamed entries cover FULL base and head, deletions cover base, additions
 cover head (including zero-byte blobs). Symlinks/submodules/non-UTF8 refuse.
@@ -35,6 +42,12 @@ wired, and no authenticity, signing, runtime or production admission is claimed.
 import hashlib
 import json
 import re
+
+
+_MAX_PR = 2147483647
+_MAX_WORKFLOW_ATTEMPT = 1000000
+_MAX_FINDINGS_PER_CHUNK = 128
+_MAX_FINDINGS_PER_RUN = 4096
 
 
 class Refused(ValueError):
@@ -90,6 +103,8 @@ def _identity(identity):
           "repository refused")
     _integer(identity["pr"], 1)
     _integer(identity["attempt"], 1)
+    _need(identity["pr"] <= _MAX_PR and identity["attempt"] <= _MAX_WORKFLOW_ATTEMPT,
+          "identity magnitude refused")
     for k in ("base", "head", "planner_sha"):
         _hex(identity[k], 40)
     _need(identity["base"] != identity["head"], "compare refused")
@@ -578,6 +593,7 @@ def verify(ledger, inventory):
               "result count refused")
         response_ids = set()
         union = {}
+        raw_findings = 0
         for chunk, result in zip(p["chunks"], ledger["results"]):
             _keys(result, "chunk_id plan_sha256 request_sha256 status identity response_id findings")
             _integer(result["chunk_id"])
@@ -591,6 +607,10 @@ def verify(ledger, inventory):
             _need(result["response_id"] not in response_ids, "duplicate response")
             response_ids.add(result["response_id"])
             _need(type(result["findings"]) is list, "findings refused")
+            _need(len(result["findings"]) <= _MAX_FINDINGS_PER_CHUNK and
+                  raw_findings + len(result["findings"]) <= _MAX_FINDINGS_PER_RUN,
+                  "resource findings refused")
+            raw_findings += len(result["findings"])
             for finding in result["findings"]:
                 _keys(finding, "path side start end severity rule message filter_reason")
                 _path(finding["path"])
