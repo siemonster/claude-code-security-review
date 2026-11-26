@@ -1,7 +1,6 @@
 name: SAST
 
 on:
-  pull_request:
   push:
     branches:
       - main
@@ -9,6 +8,10 @@ on:
 
 jobs:
   security-review:
+    # Repository secrets are available to this workflow. Run only when the
+    # checked-out commit is the trusted main ref: a push to main, or a manual
+    # dispatch of main. Any other ref is untrusted code.
+    if: "github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')"
     runs-on: ubuntu-24.04
     permissions:
       contents: read
