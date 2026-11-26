@@ -167,16 +167,15 @@ def _permission_problems(value, scope):
     return problems
 
 
-def _if_disables(value):
-    """True when a job if is boolean false or a string that means false."""
-    if value is False:
-        return True
-    if not isinstance(value, str):
+def _is_checkout(uses):
+    """True when owner/repo is actions/checkout, ignoring case and a subpath."""
+    if not isinstance(uses, str) or "@" not in uses:
         return False
-    stripped = value.strip()
-    if stripped.lower() == "false":
-        return True
-    return re.fullmatch(r"\$\{\{\s*false\s*\}\}", stripped, re.IGNORECASE) is not None
+    action, _ref = uses.rsplit("@", 1)
+    parts = action.split("/")
+    if len(parts) < 2:
+        return False
+    return parts[0].lower() == "actions" and parts[1].lower() == "checkout"
 
 
 def _step_rows(loaded):
@@ -200,10 +199,11 @@ def _step_rows(loaded):
 def _baseline_rows(rows, jobs):
     """The one unconditional checkout in the retained test job, if it exists."""
     job = jobs.get("test-claudecode") if isinstance(jobs, dict) else None
-    disabled = isinstance(job, dict) and "if" in job and _if_disables(job.get("if"))
+    if not isinstance(job, dict) or "if" in job:
+        return [], ["baseline checkout is missing"]
     matches = []
     for index, (job_name, _step_index, step) in enumerate(rows):
-        if job_name != "test-claudecode" or disabled:
+        if job_name != "test-claudecode":
             continue
         if step.get("uses") != CHECKOUT_USES or "if" in step:
             continue
@@ -223,7 +223,8 @@ def _checkout_problems(uses, with_block, baseline):
     set it to boolean false, and true is rejected on every step.
     """
     problems = []
-    if not re.fullmatch(r"actions/checkout@[0-9a-f]{40}", uses):
+    _action, ref = uses.rsplit("@", 1)
+    if not re.fullmatch(r"[0-9a-f]{40}", ref):
         problems.append("actions/checkout is not pinned to a 40-hex SHA")
     if not isinstance(with_block, dict):
         with_block = {}
@@ -285,7 +286,7 @@ def workflow_problems(text, name):
         problems.extend(baseline_problems)
     for index, (_job_name, _step_index, step) in enumerate(rows):
         uses = step.get("uses")
-        if isinstance(uses, str) and uses.startswith("actions/checkout"):
+        if _is_checkout(uses):
             problems.extend(_checkout_problems(uses, step.get("with"), index in exempt))
     if "pull_request_target" in _trigger_names(loaded.get("on")):
         problems.append("pull_request_target trigger")
@@ -567,6 +568,27 @@ def test_disabled_baseline_checkout_is_rejected():
         "  test-claudecode:\n    if: false\n    runs-on: ubuntu-latest\n",
     )
     _rejected(job_disabled, RETAINED, "baseline checkout is missing")
+    job_conditional = _once(
+        text,
+        "  test-claudecode:\n    runs-on: ubuntu-latest\n",
+        "  test-claudecode:\n    if: github.event_name == 'push'\n    runs-on: ubuntu-latest\n",
+    )
+    _rejected(job_conditional, RETAINED, "baseline checkout is missing")
+
+
+def test_checkout_owner_and_repo_are_case_insensitive():
+    text = (WORKFLOWS / RETAINED).read_text()
+    line = _checkout_line()
+    unpinned = _once(text, line, line + "      - uses: Actions/Checkout@v4\n")
+    _rejected(unpinned, RETAINED, "actions/checkout is not pinned to a 40-hex SHA")
+    hidden = _once(text, line, line + "      - uses: actions/checkout/hidden@v4\n")
+    _rejected(hidden, RETAINED, "actions/checkout is not pinned to a 40-hex SHA")
+    mixed = _once(
+        text,
+        line,
+        line + "      - uses: ACTIONS/CHECKOUT@%s\n" % CHECKOUT_PIN,
+    )
+    _rejected(mixed, RETAINED, "persist-credentials false is required")
 
 
 def test_baseline_checkout_may_set_persist_credentials_false():
