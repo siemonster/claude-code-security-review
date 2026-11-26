@@ -167,24 +167,59 @@ def _permission_problems(value, scope):
     return problems
 
 
-def _checkout_problems(uses, with_block, name):
+def _checkout_problems(uses, with_block, baseline):
+    """Judge one checkout step.
+
+    The persistence exception belongs to the single baseline step in the
+    retained workflow. Every other checkout must set the flag to false.
+    """
     problems = []
     if not re.fullmatch(r"actions/checkout@[0-9a-f]{40}", uses):
         problems.append("actions/checkout is not pinned to a 40-hex SHA")
-    elif name == RETAINED and uses != CHECKOUT_USES:
-        problems.append("retained checkout pin changed")
     if not isinstance(with_block, dict):
         with_block = {}
     if "persist-credentials" in with_block:
         flag = with_block["persist-credentials"]
         if _is_true(flag):
             problems.append("persist-credentials true")
-        if name == RETAINED:
+        if baseline:
             problems.append("persist-credentials is present on the retained checkout")
         elif flag is not False:
             problems.append("persist-credentials is not false")
-    elif name != RETAINED:
+    elif not baseline:
         problems.append("persist-credentials false is required")
+    return problems
+
+
+def _baseline_indexes(checkouts):
+    """Return which retained checkout, if any, keeps the persistence exception."""
+    pinned = [index for index, (uses, _) in enumerate(checkouts) if uses == CHECKOUT_USES]
+    bare = [
+        index
+        for index, (uses, with_block) in enumerate(checkouts)
+        if uses == CHECKOUT_USES and "persist-credentials" not in with_block
+    ]
+    problems = []
+    exempt = []
+    if len(pinned) == 0:
+        problems.append("baseline checkout is missing")
+    elif len(pinned) == 1:
+        exempt = pinned
+    elif len(bare) == 1:
+        exempt = bare
+    else:
+        problems.append("baseline checkout is not unique")
+    return exempt, problems
+
+
+def _secret_problems(value, prefix):
+    problems = []
+    if not isinstance(value, str):
+        return problems
+    lowered = value.lower()
+    for marker in SECRET_MARKERS:
+        if marker.lower() in lowered:
+            problems.append("%s %s" % (prefix, marker))
     return problems
 
 
@@ -193,9 +228,7 @@ def workflow_problems(text, name):
     problems = []
     if not isinstance(text, str):
         return ["workflow text is not a string"]
-    for marker in SECRET_MARKERS:
-        if marker in text:
-            problems.append("secret reference %s" % marker)
+    problems.extend(_secret_problems(text, "secret reference"))
     if "pull_request_target" in text:
         problems.append("pull_request_target trigger")
     try:
@@ -209,19 +242,27 @@ def workflow_problems(text, name):
     if True in loaded:
         problems.append("trigger key parsed as a boolean")
     for value in _strings(loaded):
-        for marker in SECRET_MARKERS:
-            if marker in value:
-                problems.append("parsed secret reference %s" % marker)
+        problems.extend(_secret_problems(value, "parsed secret reference"))
+    checkouts = []
     for node in _walk(loaded):
         uses = node.get("uses")
         if isinstance(uses, str) and (uses == "./" or uses.startswith("./")):
             problems.append("local composite uses")
         if isinstance(uses, str) and uses.startswith("actions/checkout"):
-            problems.extend(_checkout_problems(uses, node.get("with"), name))
+            with_block = node.get("with")
+            if not isinstance(with_block, dict):
+                with_block = {}
+            checkouts.append((uses, with_block))
         if "comment-pr" in node and _is_true(node["comment-pr"]):
             problems.append("comment-pr true")
         if "upload-results" in node and _is_true(node["upload-results"]):
             problems.append("upload-results true")
+    exempt = []
+    if name == RETAINED:
+        exempt, baseline_problems = _baseline_indexes(checkouts)
+        problems.extend(baseline_problems)
+    for index, (uses, with_block) in enumerate(checkouts):
+        problems.extend(_checkout_problems(uses, with_block, index in exempt))
     if "pull_request_target" in _trigger_names(loaded.get("on")):
         problems.append("pull_request_target trigger")
     if "permissions" in loaded:
@@ -347,6 +388,30 @@ def test_added_secret_references_are_rejected():
     _rejected(oauth, RETAINED, "secret reference CLAUDE_CODE_OAUTH_TOKEN")
 
 
+def test_secret_identifiers_are_case_insensitive():
+    text = (WORKFLOWS / RETAINED).read_text()
+    assert "Install Claude CLI" in text
+    assert "claude-code" in text
+    assert workflow_problems(text, RETAINED) == []
+    lower = text + "\n      - run: echo\n        env:\n          EXAMPLE: ${{ secrets.claude_api_key }}\n"
+    mixed = text + "\n      - run: echo\n        env:\n          EXAMPLE: ${{ secrets.Claude_Code_OAuth_Token }}\n"
+    custom = text + "\n      - run: echo\n        env:\n          EXAMPLE: ${{ secrets.claude_custom }}\n"
+    _rejected(lower, RETAINED, "secret reference CLAUDE_API_KEY")
+    _rejected(mixed, RETAINED, "secret reference CLAUDE_CODE_OAUTH_TOKEN")
+    _rejected(custom, RETAINED, "secret reference secrets.CLAUDE_")
+    ordinary = (
+        "name: extra\n"
+        "on:\n"
+        "  workflow_dispatch:\n"
+        "jobs:\n"
+        "  test:\n"
+        "    runs-on: ubuntu-latest\n"
+        "    steps:\n"
+        "      - run: echo Install Claude CLI && npm install @anthropic-ai/claude-code\n"
+    )
+    assert not any("secret reference" in problem for problem in workflow_problems(ordinary, "extra.yml"))
+
+
 def test_local_composite_is_rejected():
     text = (WORKFLOWS / RETAINED).read_text() + "\n      - uses: ./\n"
     _rejected(text, RETAINED, "local composite uses")
@@ -422,3 +487,30 @@ def test_nonbaseline_checkout_must_disable_persist_credentials():
         "          persist-credentials: true\n" % CHECKOUT_USES,
     )
     _rejected(retained, RETAINED, "persist-credentials true")
+
+
+def _checkout_line():
+    return "      - uses: %s # v4.3.1 pinned to commit hash\n" % CHECKOUT_USES
+
+
+def test_retained_baseline_checkout_is_required():
+    text = (WORKFLOWS / RETAINED).read_text()
+    assert workflow_problems(text, RETAINED) == []
+    removed = _once(text, _checkout_line(), "")
+    _rejected(removed, RETAINED, "baseline checkout is missing")
+
+
+def test_second_retained_checkout_must_disable_persist_credentials():
+    text = (WORKFLOWS / RETAINED).read_text()
+    line = _checkout_line()
+    bare = _once(text, line, line + "      - uses: %s\n" % CHECKOUT_USES)
+    _rejected(bare, RETAINED, "persist-credentials false is required")
+    other_pin = "actions/checkout@" + ("a" * 40)
+    other = _once(text, line, line + "      - uses: %s\n" % other_pin)
+    _rejected(other, RETAINED, "persist-credentials false is required")
+    closed = _once(
+        text,
+        line,
+        line + "      - uses: %s\n        with:\n          persist-credentials: false\n" % other_pin,
+    )
+    assert workflow_problems(closed, RETAINED) == []
