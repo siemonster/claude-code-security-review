@@ -167,49 +167,76 @@ def _permission_problems(value, scope):
     return problems
 
 
+def _if_disables(value):
+    """True when a job if is boolean false or a string that means false."""
+    if value is False:
+        return True
+    if not isinstance(value, str):
+        return False
+    stripped = value.strip()
+    if stripped.lower() == "false":
+        return True
+    return re.fullmatch(r"\$\{\{\s*false\s*\}\}", stripped, re.IGNORECASE) is not None
+
+
+def _step_rows(loaded):
+    """Return (job name, step index, step mapping) without mixing jobs together."""
+    jobs = loaded.get("jobs")
+    if not isinstance(jobs, dict):
+        return []
+    rows = []
+    for job_name, job in jobs.items():
+        if not isinstance(job, dict):
+            continue
+        steps = job.get("steps")
+        if not isinstance(steps, list):
+            continue
+        for index, step in enumerate(steps):
+            if isinstance(step, dict):
+                rows.append((str(job_name), index, step))
+    return rows
+
+
+def _baseline_rows(rows, jobs):
+    """The one unconditional checkout in the retained test job, if it exists."""
+    job = jobs.get("test-claudecode") if isinstance(jobs, dict) else None
+    disabled = isinstance(job, dict) and "if" in job and _if_disables(job.get("if"))
+    matches = []
+    for index, (job_name, _step_index, step) in enumerate(rows):
+        if job_name != "test-claudecode" or disabled:
+            continue
+        if step.get("uses") != CHECKOUT_USES or "if" in step:
+            continue
+        matches.append(index)
+    if len(matches) == 1:
+        return matches, []
+    if len(matches) == 0:
+        return [], ["baseline checkout is missing"]
+    return [], ["baseline checkout is not unique"]
+
+
 def _checkout_problems(uses, with_block, baseline):
     """Judge one checkout step.
 
-    The persistence exception belongs to the single baseline step in the
-    retained workflow. Every other checkout must set the flag to false.
+    Only the identified baseline step may omit persist-credentials. That
+    step may also set the flag to boolean false. Every other checkout must
+    set it to boolean false, and true is rejected on every step.
     """
     problems = []
     if not re.fullmatch(r"actions/checkout@[0-9a-f]{40}", uses):
         problems.append("actions/checkout is not pinned to a 40-hex SHA")
     if not isinstance(with_block, dict):
         with_block = {}
-    if "persist-credentials" in with_block:
-        flag = with_block["persist-credentials"]
-        if _is_true(flag):
-            problems.append("persist-credentials true")
-        if baseline:
-            problems.append("persist-credentials is present on the retained checkout")
-        elif flag is not False:
-            problems.append("persist-credentials is not false")
-    elif not baseline:
-        problems.append("persist-credentials false is required")
+    if "persist-credentials" not in with_block:
+        if not baseline:
+            problems.append("persist-credentials false is required")
+        return problems
+    flag = with_block["persist-credentials"]
+    if _is_true(flag):
+        problems.append("persist-credentials true")
+    if flag is not False:
+        problems.append("persist-credentials is not false")
     return problems
-
-
-def _baseline_indexes(checkouts):
-    """Return which retained checkout, if any, keeps the persistence exception."""
-    pinned = [index for index, (uses, _) in enumerate(checkouts) if uses == CHECKOUT_USES]
-    bare = [
-        index
-        for index, (uses, with_block) in enumerate(checkouts)
-        if uses == CHECKOUT_USES and "persist-credentials" not in with_block
-    ]
-    problems = []
-    exempt = []
-    if len(pinned) == 0:
-        problems.append("baseline checkout is missing")
-    elif len(pinned) == 1:
-        exempt = pinned
-    elif len(bare) == 1:
-        exempt = bare
-    else:
-        problems.append("baseline checkout is not unique")
-    return exempt, problems
 
 
 def _secret_problems(value, prefix):
@@ -243,26 +270,23 @@ def workflow_problems(text, name):
         problems.append("trigger key parsed as a boolean")
     for value in _strings(loaded):
         problems.extend(_secret_problems(value, "parsed secret reference"))
-    checkouts = []
     for node in _walk(loaded):
         uses = node.get("uses")
         if isinstance(uses, str) and (uses == "./" or uses.startswith("./")):
             problems.append("local composite uses")
-        if isinstance(uses, str) and uses.startswith("actions/checkout"):
-            with_block = node.get("with")
-            if not isinstance(with_block, dict):
-                with_block = {}
-            checkouts.append((uses, with_block))
         if "comment-pr" in node and _is_true(node["comment-pr"]):
             problems.append("comment-pr true")
         if "upload-results" in node and _is_true(node["upload-results"]):
             problems.append("upload-results true")
+    rows = _step_rows(loaded)
     exempt = []
     if name == RETAINED:
-        exempt, baseline_problems = _baseline_indexes(checkouts)
+        exempt, baseline_problems = _baseline_rows(rows, loaded.get("jobs"))
         problems.extend(baseline_problems)
-    for index, (uses, with_block) in enumerate(checkouts):
-        problems.extend(_checkout_problems(uses, with_block, index in exempt))
+    for index, (_job_name, _step_index, step) in enumerate(rows):
+        uses = step.get("uses")
+        if isinstance(uses, str) and uses.startswith("actions/checkout"):
+            problems.extend(_checkout_problems(uses, step.get("with"), index in exempt))
     if "pull_request_target" in _trigger_names(loaded.get("on")):
         problems.append("pull_request_target trigger")
     if "permissions" in loaded:
@@ -513,4 +537,47 @@ def test_second_retained_checkout_must_disable_persist_credentials():
         line,
         line + "      - uses: %s\n        with:\n          persist-credentials: false\n" % other_pin,
     )
+    assert workflow_problems(closed, RETAINED) == []
+
+
+def test_baseline_checkout_moved_to_another_job_is_rejected():
+    text = (WORKFLOWS / RETAINED).read_text()
+    line = _checkout_line()
+    moved = _once(text, line, "")
+    if not moved.endswith("\n"):
+        moved += "\n"
+    moved += "  other:\n    runs-on: ubuntu-latest\n    steps:\n" + line
+    _rejected(moved, RETAINED, "baseline checkout is missing")
+
+
+def test_disabled_baseline_checkout_is_rejected():
+    text = (WORKFLOWS / RETAINED).read_text()
+    line = _checkout_line()
+    disabled = _once(text, line, line + "        if: false\n")
+    _rejected(disabled, RETAINED, "baseline checkout is missing")
+    conditional = _once(
+        text,
+        line,
+        line + "        if: github.event_name == 'pull_request'\n",
+    )
+    _rejected(conditional, RETAINED, "baseline checkout is missing")
+    job_disabled = _once(
+        text,
+        "  test-claudecode:\n    runs-on: ubuntu-latest\n",
+        "  test-claudecode:\n    if: false\n    runs-on: ubuntu-latest\n",
+    )
+    _rejected(job_disabled, RETAINED, "baseline checkout is missing")
+
+
+def test_baseline_checkout_may_set_persist_credentials_false():
+    text = (WORKFLOWS / RETAINED).read_text()
+    line = _checkout_line()
+    closed = _once(
+        text,
+        line,
+        "      - uses: %s # v4.3.1 pinned to commit hash\n"
+        "        with:\n"
+        "          persist-credentials: false\n" % CHECKOUT_USES,
+    )
+    assert "if:" not in closed.split("jobs:", 1)[1].split("steps:", 1)[1].split("- name:", 1)[0]
     assert workflow_problems(closed, RETAINED) == []
