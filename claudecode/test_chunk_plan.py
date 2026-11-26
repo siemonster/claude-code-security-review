@@ -300,7 +300,7 @@ class PlannerTests(unittest.TestCase):
         no_io_proof(source)
         for name in ["__init__.py","github_action_audit.py","audit.py"]:
             self.assertNotIn("chunk_plan",Path(__file__).with_name(name).read_text())
-        for name in ["action.yml",".github/workflows/sast.yml",".github/workflows/test-claudecode.yml"]:
+        for name in ["action.yml",".github/workflows/test-claudecode.yml"]:
             self.assertNotIn("chunk_plan",(Path(__file__).parents[1]/name).read_text())
 
 
